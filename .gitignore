@@ -51,3 +51,6 @@ emulator_run_*.log
 flutter_run_*.log
 phone_run_*.log
 window_dump*.xml
+
+# Local screenshots
+rtl_screen*.png

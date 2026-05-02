@@ -11,14 +11,6 @@ Android-first Flutter application for tracking RTL bus routes, live vehicle posi
 - Cache-first startup for faster initial load
 - Theme customization (system/light/dark + accent themes)
 
-## Screenshots
-
-Add screenshots here:
-
-- `assets/screenshots/home.png`
-- `assets/screenshots/route-details.png`
-- `assets/screenshots/stop-alerts.png`
-
 ## Tech Stack
 
 - Flutter `3.41.9`
@@ -125,14 +117,6 @@ flutter pub get
 ```bash
 flutter devices
 ```
-
-## Roadmap
-
-- [ ] Add iOS/Web/Desktop support evaluation
-- [ ] Add automated CI for format/analyze/test/build
-- [ ] Expand unit/widget/integration test coverage
-- [ ] Introduce runtime-configurable environment strategy
-- [ ] Prepare production release signing and distribution pipeline
 
 ## License
 
