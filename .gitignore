@@ -1,0 +1,53 @@
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editor/IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+.pub-cache/
+build/
+coverage/
+
+# Android/Gradle
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/**/build/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*.pid
+
+# Environment and secrets
+.env
+.env.*
+*.keystore
+*.jks
+key.properties
+
+# Generated artifacts
+app.*.symbols
+app.*.map.json
+
+# Project-local diagnostics
+analyze_output.log
+emulator_run_*.log
+flutter_run_*.log
+phone_run_*.log
+window_dump*.xml

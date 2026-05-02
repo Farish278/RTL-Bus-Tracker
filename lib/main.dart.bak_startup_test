@@ -1,0 +1,74 @@
+import 'dart:async';
+import 'dart:ui';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'core/utils/debug_log.dart';
+import 'features/map/data/background/background_alert_worker.dart';
+import 'app/app.dart';
+
+final ValueNotifier<StartupErrorState?> startupErrorNotifier =
+    ValueNotifier<StartupErrorState?>(null);
+
+class StartupErrorState {
+  const StartupErrorState(this.error, this.stackTrace);
+
+  final Object error;
+  final StackTrace stackTrace;
+}
+
+Future<void> main() async {
+  await runZonedGuarded(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      DebugLog.info('App startup begin');
+
+      FlutterError.onError = (details) {
+        FlutterError.presentError(details);
+        _reportStartupError(
+          details.exception,
+          details.stack ?? StackTrace.current,
+        );
+      };
+
+      PlatformDispatcher.instance.onError = (error, stack) {
+        _reportStartupError(error, stack);
+        return true;
+      };
+
+      runApp(const ProviderScope(child: RtlBusTrackerBootstrap()));
+      DebugLog.info('App startup first frame scheduled');
+    },
+    (error, stack) {
+      _reportStartupError(error, stack);
+    },
+  );
+}
+
+void _reportStartupError(Object error, StackTrace stack) {
+  DebugLog.info('Startup error: $error');
+  startupErrorNotifier.value = StartupErrorState(error, stack);
+}
+
+class RtlBusTrackerBootstrap extends StatefulWidget {
+  const RtlBusTrackerBootstrap({super.key});
+
+  @override
+  State<RtlBusTrackerBootstrap> createState() => _RtlBusTrackerBootstrapState();
+}
+
+class _RtlBusTrackerBootstrapState extends State<RtlBusTrackerBootstrap> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // TODO: Keep startup lightweight; background worker is initialized lazily.
+      BackgroundAlertWorker.initialize().catchError((e, st) {
+        _reportStartupError(e, st);
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => const RtlBusTrackerApp();
+}
