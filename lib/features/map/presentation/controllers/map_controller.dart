@@ -419,7 +419,10 @@ class MapController extends StateNotifier<MapState> {
   bool _isImmediateLiveFetchInFlight = false;
   int _staticRefreshGeneration = 0;
 
-  Future<void> loadInitial({bool force = false}) async {
+  Future<void> loadInitial({
+    bool force = false,
+    bool shouldAutoFit = true,
+  }) async {
     DebugLog.info('loadInitial(force: $force) start');
     final hadRoutes = state.routes.isNotEmpty;
     state = state.copyWith(
@@ -504,7 +507,9 @@ class MapController extends StateNotifier<MapState> {
           selectedRouteCodes,
         ),
       );
-      _scheduleFit();
+      if (shouldAutoFit) {
+        _scheduleFit();
+      }
       await _restartLiveWatch();
       if (shouldClearActiveAlert) {
         if (state.activeAlert != null) {

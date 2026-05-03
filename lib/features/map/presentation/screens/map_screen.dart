@@ -42,9 +42,11 @@ class _MapScreenState extends ConsumerState<MapScreen>
   LatLng? _lastFollowPoint;
   DateTime _lastFollowMoveAt = DateTime.fromMillisecondsSinceEpoch(0);
   ProviderSubscription<MapState>? _stateSub;
+  final ScrollController _routeChipsScrollController = ScrollController();
   String _routeStopSearch = '';
-  bool _upcomingOnly = false;
   final Map<String, String?> _selectedDirectionByRoute = {};
+  final Map<String, bool> _expandedStopScheduleByKey = {};
+  final Map<String, bool> _expandedRouteStopTimesByKey = {};
   Object? _mapBuildError;
   static const Color _stableRouteFallbackColor = Color(0xFF1565C0);
 
@@ -63,8 +65,9 @@ class _MapScreenState extends ConsumerState<MapScreen>
           _isFollowingSelectedBus = false;
           _lastFollowPoint = null;
           _routeStopSearch = '';
-          _upcomingOnly = false;
           _selectedDirectionByRoute.clear();
+          _expandedStopScheduleByKey.clear();
+          _expandedRouteStopTimesByKey.clear();
         });
       }
       _handleFollowState(next);
@@ -85,6 +88,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
   @override
   void dispose() {
     _stateSub?.close();
+    _routeChipsScrollController.dispose();
     WidgetsBinding.instance.removeObserver(this);
     ref.read(mapControllerProvider.notifier).setMapScreenActive(false);
     super.dispose();
@@ -455,7 +459,8 @@ class _MapScreenState extends ConsumerState<MapScreen>
                         const SizedBox(width: 8),
                         const Spacer(),
                         IconButton.filledTonal(
-                          onPressed: () => c.loadInitial(force: true),
+                          onPressed: () =>
+                              c.loadInitial(force: true, shouldAutoFit: false),
                           icon: const Icon(Icons.refresh),
                           tooltip: 'Refresh',
                           style: IconButton.styleFrom(
@@ -534,6 +539,10 @@ class _MapScreenState extends ConsumerState<MapScreen>
                           SizedBox(
                             height: 44,
                             child: ListView(
+                              key: const PageStorageKey<String>(
+                                'route_chip_list',
+                              ),
+                              controller: _routeChipsScrollController,
                               scrollDirection: Axis.horizontal,
                               children: state.routes.map((r) {
                                 final selected = state.selectedRouteCodes
@@ -813,7 +822,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
             if (effectiveDirectionId == null) return true;
             return entry.direction?.id == effectiveDirectionId;
           });
-          return !_upcomingOnly || entries.isNotEmpty;
+          return entries.isNotEmpty;
         })
         .toList();
     final entries =
@@ -938,12 +947,6 @@ class _MapScreenState extends ConsumerState<MapScreen>
             border: OutlineInputBorder(),
           ),
         ),
-        const SizedBox(height: 8),
-        FilterChip(
-          selected: _upcomingOnly,
-          label: const Text('With timings only'),
-          onSelected: (v) => setState(() => _upcomingOnly = v),
-        ),
         const SizedBox(height: 10),
         if (loading)
           const Center(
@@ -971,6 +974,10 @@ class _MapScreenState extends ConsumerState<MapScreen>
           )
         else
           ...stops.map((stop) {
+            final stopExpansionKey =
+                '${route.routeCode}:${stop.stopCode}:${effectiveDirectionId ?? 'all'}';
+            final isExpanded =
+                _expandedRouteStopTimesByKey[stopExpansionKey] ?? false;
             final times = stop.entries
                 .where(
                   (entry) =>
@@ -981,6 +988,11 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 .where((t) => t.isNotEmpty)
                 .toSet()
                 .toList();
+            const collapsedLimit = 8;
+            final hasMoreThanCollapsedLimit = times.length > collapsedLimit;
+            final visibleTimes = isExpanded
+                ? times
+                : times.take(collapsedLimit).toList();
             return Card(
               margin: const EdgeInsets.only(bottom: 8),
               child: Padding(
@@ -1017,8 +1029,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
                             Wrap(
                               spacing: 6,
                               runSpacing: 6,
-                              children: times
-                                  .take(8)
+                              children: visibleTimes
                                   .map(
                                     (t) => Chip(
                                       label: Text(t),
@@ -1027,6 +1038,22 @@ class _MapScreenState extends ConsumerState<MapScreen>
                                   )
                                   .toList(),
                             ),
+                            if (hasMoreThanCollapsedLimit)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: TextButton(
+                                  onPressed: () => setState(
+                                    () =>
+                                        _expandedRouteStopTimesByKey[stopExpansionKey] =
+                                            !isExpanded,
+                                  ),
+                                  child: Text(
+                                    isExpanded
+                                        ? 'Show less'
+                                        : 'Show all ${times.length}',
+                                  ),
+                                ),
+                              ),
                           ],
                         ],
                       ),
@@ -1079,6 +1106,12 @@ class _MapScreenState extends ConsumerState<MapScreen>
     final stopSchedule = selectedSchedule?.stops.firstWhereOrNull(
       (s) => s.stopCode == stop.code,
     );
+    final stopScheduleExpansionKey = selectedRoute == null
+        ? null
+        : '${stop.code}:${selectedRoute.routeCode}';
+    final isStopScheduleExpanded = stopScheduleExpansionKey != null
+        ? (_expandedStopScheduleByKey[stopScheduleExpansionKey] ?? false)
+        : false;
     final isActive =
         activeAlert?.stopCode == stop.code &&
         selectedRoute != null &&
@@ -1216,19 +1249,52 @@ class _MapScreenState extends ConsumerState<MapScreen>
             message: 'Route schedule shown. Stop-specific times unavailable.',
           )
         else ...[
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: stopSchedule.entries
-                .map((e) => _formatTime(e.timeLabel))
-                .toSet()
-                .map(
-                  (t) => Chip(
-                    label: Text(t),
-                    visualDensity: VisualDensity.compact,
+          Builder(
+            builder: (context) {
+              const collapsedLimit = 10;
+              final times = stopSchedule.entries
+                  .map((e) => _formatTime(e.timeLabel))
+                  .toSet()
+                  .toList();
+              final hasMoreThanCollapsedLimit = times.length > collapsedLimit;
+              final visibleTimes = isStopScheduleExpanded
+                  ? times
+                  : times.take(collapsedLimit).toList();
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: visibleTimes
+                        .map(
+                          (t) => Chip(
+                            label: Text(t),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        )
+                        .toList(),
                   ),
-                )
-                .toList(),
+                  if (hasMoreThanCollapsedLimit &&
+                      stopScheduleExpansionKey != null)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton(
+                        onPressed: () => setState(
+                          () =>
+                              _expandedStopScheduleByKey[stopScheduleExpansionKey] =
+                                  !isStopScheduleExpanded,
+                        ),
+                        child: Text(
+                          isStopScheduleExpanded
+                              ? 'Show less'
+                              : 'Show all ${times.length} times',
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
           ),
         ],
         const SizedBox(height: 10),
@@ -1283,13 +1349,8 @@ class _MapScreenState extends ConsumerState<MapScreen>
             icon: Icons.notifications_active_outlined,
             message: 'Alert active: within ${_distanceLabel(selectedDistance)}',
           ),
-        if (viewState.alertTriggered)
-          _scheduleMessageCard(
-            context,
-            icon: Icons.check_circle_outline,
-            message: 'Alert triggered',
-          ),
-        if (viewState.alertStatusMessage != null)
+        if (viewState.alertStatusMessage != null &&
+            !_isTriggeredStatusMessage(viewState.alertStatusMessage!))
           _scheduleMessageCard(
             context,
             icon: Icons.info_outline,
@@ -1496,6 +1557,13 @@ class _MapScreenState extends ConsumerState<MapScreen>
     final text = raw.trim();
     if (text.length >= 5 && text[2] == ':') return text.substring(0, 5);
     return text;
+  }
+
+  bool _isTriggeredStatusMessage(String message) {
+    final normalized = message.trim().toLowerCase();
+    return normalized == 'alert triggered' ||
+        normalized == 'alert triggered.' ||
+        normalized.contains('alert triggered');
   }
 
   Widget _buildBusCard(

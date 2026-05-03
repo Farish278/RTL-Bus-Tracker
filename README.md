@@ -1,3 +1,5 @@
+ï»¿![RTL Bus Tracker Banner](assets/images/github-app-banner.png)
+
 # RTL Bus Tracker
 
 Android-first Flutter application for tracking RTL bus routes, live vehicle positions, stop ETAs, and nearby stop alerts.
@@ -84,11 +86,11 @@ rtl_bus_tracker/
 +- android/
 +- assets/
 +- lib/
-¦  +- app/
-¦  +- core/
-¦  +- features/
-¦     +- map/
-¦     +- settings/
+Â¦  +- app/
+Â¦  +- core/
+Â¦  +- features/
+Â¦     +- map/
+Â¦     +- settings/
 +- test/
 +- pubspec.yaml
 +- README.md
@@ -121,3 +123,5 @@ flutter devices
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+
