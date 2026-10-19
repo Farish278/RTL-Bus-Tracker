@@ -38,8 +38,34 @@ jobs:
       - name: Test
         run: flutter test
 
+      - name: Restore release signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?Missing release keystore secret}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing release keystore password}"
+          : "${ANDROID_KEY_ALIAS:?Missing release key alias}"
+          : "${ANDROID_KEY_PASSWORD:?Missing release key password}"
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/release-keystore.jks
+          printf 'storeFile=release-keystore.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" > android/key.properties
+
       - name: Build release APK
         run: flutter build apk --release
+
+      - name: Verify release signing certificate
+        run: |
+          set -euo pipefail
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          "$build_tools/apksigner" verify --verbose --print-certs build/app/outputs/flutter-apk/app-release.apk | tee "$RUNNER_TEMP/apk-certificate.txt"
+          actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apk-certificate.txt")
+          expected=$(tr -d '\r\n' < android/release-certificate.sha256)
+          test "$actual" = "$expected" || { echo 'Release signing certificate mismatch'; exit 1; }
 
       - name: Upload artifact to release
         if: github.event_name == 'release'
@@ -47,3 +73,8 @@ jobs:
         with:
           files: |
             build/app/outputs/flutter-apk/app-release.apk
+          fail_on_unmatched_files: true
+
+      - name: Remove signing files
+        if: always()
+        run: rm -f android/key.properties android/release-keystore.jks

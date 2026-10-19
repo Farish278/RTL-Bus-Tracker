@@ -96,7 +96,9 @@ flutter build apk --release
 
 Output: `build/app/outputs/flutter-apk/app-release.apk`. For a debug APK, use `flutter build apk --debug`.
 
-Release builds currently use the debug signing configuration in [android/app/build.gradle.kts](android/app/build.gradle.kts) for internal testing. Configure release signing before production distribution.
+Release builds require the persistent signing key configured through `android/key.properties`. GitHub Actions restores it from repository secrets and verifies the APK certificate before publishing. See [Release signing](docs/RELEASE_SIGNING.md) for local setup and backup instructions.
+
+Version 1.1.1 starts the permanent signing identity. Users of the older debug-signed APKs must uninstall the old app once before installing 1.1.1, which clears local app data. Later releases signed with this key can install as updates.
 
 Publishing a GitHub release triggers the [release build workflow](.github/workflows/release-build.yml), which builds and attaches `app-release.apk`. Keeping that asset name preserves the direct download links above.
 

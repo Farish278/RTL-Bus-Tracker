@@ -40,6 +40,7 @@ android/**/build/
 *.keystore
 *.jks
 key.properties
+key.properties.*
 
 # Generated artifacts
 app.*.symbols
