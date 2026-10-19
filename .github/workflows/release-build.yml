@@ -76,12 +76,10 @@ jobs:
 
       - name: Upload artifact to release
         if: github.event_name == 'release' || inputs.release_tag != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag || github.event.release.tag_name }}
-          files: |
-            build/app/outputs/flutter-apk/app-release.apk
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" build/app/outputs/flutter-apk/app-release.apk --clobber
 
       - name: Remove signing files
         if: always()
