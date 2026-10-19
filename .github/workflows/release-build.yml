@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to rebuild and attach the APK to'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -16,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -63,14 +70,15 @@ jobs:
           set -euo pipefail
           build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
           "$build_tools/apksigner" verify --verbose --print-certs build/app/outputs/flutter-apk/app-release.apk | tee "$RUNNER_TEMP/apk-certificate.txt"
-          actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apk-certificate.txt")
+          actual=$(sed -n 's/^.*certificate SHA-256 digest: //p' "$RUNNER_TEMP/apk-certificate.txt" | sort -u)
           expected=$(tr -d '\r\n' < android/release-certificate.sha256)
           test "$actual" = "$expected" || { echo 'Release signing certificate mismatch'; exit 1; }
 
       - name: Upload artifact to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.event.release.tag_name }}
           files: |
             build/app/outputs/flutter-apk/app-release.apk
           fail_on_unmatched_files: true
