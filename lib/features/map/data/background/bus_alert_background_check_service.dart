@@ -29,11 +29,23 @@ class BusAlertBackgroundCheckService {
   BusAlertBackgroundCheckService({
     BusAlertRepository? repository,
     AlertEvaluationService? alertEvaluationService,
-  }) : _repository = repository ?? BusAlertRepository(),
+    Future<List<BusLocation>> Function(String)? liveFetcher,
+    Future<void> Function()? prepareNotifications,
+    Future<void> Function(PersistedBusAlert, BusLocation)? notify,
+  }) : _prepareNotifications = prepareNotifications,
+       _notify = notify,
+       _liveFetcher = liveFetcher,
+       _repository = repository ?? BusAlertRepository(),
        _alertEvaluationService =
            alertEvaluationService ?? AlertEvaluationService();
 
+  final Future<void> Function()? _prepareNotifications;
+  final Future<void> Function(PersistedBusAlert, BusLocation)? _notify;
+  bool _notificationsReady = false;
+  Future<BusAlertCheckResult>? _inFlight;
   final BusAlertRepository _repository;
+  final Future<List<BusLocation>> Function(String)? _liveFetcher;
+  final RtlBusApi _api = RtlBusApi(DioClient());
   final AlertEvaluationService _alertEvaluationService;
 
   static const _notificationChannelId = 'rtl_stop_alerts';
@@ -41,13 +53,49 @@ class BusAlertBackgroundCheckService {
   static const _notificationChannelDescription =
       'Notifications when a selected bus route is near a selected stop';
 
-  Future<BusAlertCheckResult> runOnce({required String source}) async {
+  Future<BusAlertCheckResult> runOnce({
+    required String source,
+    Set<String>? routeCodes,
+  }) async {
+    if (_inFlight case final existing?) return existing;
+    final future = _runOnce(source: source, routeCodes: routeCodes);
+    _inFlight = future;
+    try {
+      return await future;
+    } finally {
+      _inFlight = null;
+    }
+  }
+
+  Future<BusAlertCheckResult> _runOnce({
+    required String source,
+    Set<String>? routeCodes,
+  }) async {
     final checkedAt = DateTime.now();
     DebugLog.info('RTLBusAlertService runOnce start source=$source');
 
+    var activeCount = 0;
     try {
       await _repository.migrateLegacyIfNeeded();
-      final alerts = await _repository.getActiveAlerts();
+      final allAlerts = await _repository.getActiveAlerts();
+      activeCount = allAlerts.length;
+      final alerts = routeCodes == null
+          ? allAlerts
+          : allAlerts
+                .where(
+                  (a) => routeCodes.contains(
+                    (a.liveApiRouteParam ?? a.routeCode).trim(),
+                  ),
+                )
+                .toList();
+      if (alerts.isEmpty && allAlerts.isNotEmpty) {
+        return BusAlertCheckResult(
+          checkedAt: checkedAt,
+          activeAlertsCount: activeCount,
+          triggeredAlertsCount: 0,
+          routeBusesCount: 0,
+        );
+      }
       DebugLog.info(
         'RTLBusAlertService active alerts count loaded in service: ${alerts.length}',
       );
@@ -78,16 +126,21 @@ class BusAlertBackgroundCheckService {
           .toSet()
           .toList();
 
-      final api = RtlBusApi(DioClient());
-      final List<BusLocation> buses = [];
-      for (final route in routeParams) {
-        DebugLog.info('RTLBusAlertService live bus fetch start route=$route');
-        final live = await api.fetchLive(route);
-        buses.addAll(live);
-        DebugLog.info(
-          'RTLBusAlertService live bus fetch end route=$route count=${live.length}',
-        );
-      }
+      final buses = <BusLocation>[];
+      final failedRoutes = <String>{};
+      await Future.wait(
+        routeParams.map((route) async {
+          try {
+            buses.addAll(
+              await (_liveFetcher?.call(route) ??
+                  _api.fetchLiveCoordinates(route)),
+            );
+          } catch (error) {
+            failedRoutes.add(route);
+            DebugLog.info('Alert coordinates failed for $route: $error');
+          }
+        }),
+      );
 
       final evaluations = _alertEvaluationService.evaluateAlerts(
         activeAlerts: alerts.map((a) => a.toStopAlert()).toList(),
@@ -101,6 +154,11 @@ class BusAlertBackgroundCheckService {
 
       for (var i = 0; i < alerts.length; i++) {
         final alert = alerts[i];
+        if (failedRoutes.contains(
+          (alert.liveApiRouteParam ?? alert.routeCode).trim(),
+        )) {
+          continue;
+        }
         final result = evaluations[i];
         latestNearest = result.nearestBusDistanceMeters ?? latestNearest;
         latestRouteBusesCount = result.matchedRouteBusCount;
@@ -114,29 +172,40 @@ class BusAlertBackgroundCheckService {
           'RTLBusAlertService alert evaluation result triggered alertId=${alert.id}',
         );
 
-        triggeredCount++;
+        if (!(await _repository.getActiveAlerts()).any(
+          (a) => a.id == alert.id,
+        )) {
+          continue;
+        }
+        if (!await _repository.claimNotification(alert.id)) continue;
         final bus = result.nearestBus!;
         try {
-          final notifications = FlutterLocalNotificationsPlugin();
-          await notifications.initialize(
-            const InitializationSettings(
-              android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-            ),
-          );
-          await notifications.show(
-            alert.notificationId,
-            'Bus approaching ${alert.stopName}',
-            '${alert.routeLabel}: ${bus.busCode.isNotEmpty ? bus.busCode : bus.plateNumber} is within ${alert.distanceThresholdMeters.toInt()}m',
-            const NotificationDetails(
-              android: AndroidNotificationDetails(
-                _notificationChannelId,
-                _notificationChannelName,
-                channelDescription: _notificationChannelDescription,
-                importance: Importance.max,
-                priority: Priority.high,
+          if (_notify != null) {
+            await _notify(alert, bus);
+          } else {
+            final notifications = FlutterLocalNotificationsPlugin();
+            await notifications.initialize(
+              const InitializationSettings(
+                android: AndroidInitializationSettings('@mipmap/ic_launcher'),
               ),
-            ),
-          );
+            );
+            await notifications.show(
+              alert.notificationId,
+              'Bus approaching ${alert.stopName}',
+              '${alert.routeLabel}: ${bus.busCode.isNotEmpty ? bus.busCode : bus.plateNumber} is within ${alert.distanceThresholdMeters.toInt()}m',
+              const NotificationDetails(
+                android: AndroidNotificationDetails(
+                  _notificationChannelId,
+                  _notificationChannelName,
+                  channelDescription: _notificationChannelDescription,
+                  importance: Importance.max,
+                  priority: Priority.high,
+                ),
+              ),
+            );
+          }
+          await _repository.completeNotification(alert.id);
+          triggeredCount++;
           DebugLog.info(
             'RTLBusAlertService alert notification shown alertId=${alert.id}',
           );
@@ -150,18 +219,23 @@ class BusAlertBackgroundCheckService {
           );
           lastTriggeredAlertId = alert.id;
         } catch (e) {
+          await _repository.releaseNotification(alert.id);
           DebugLog.info('RTLBusAlertService alert notification error: $e');
         }
       }
 
+      final remainingCount = (await _repository.getActiveAlerts()).length;
       await _repository.saveStatus(
         (await _repository.getStatus()).copyWith(
           method: 'Foreground service',
           lastCheckAt: checkedAt,
           lastResult:
               'Checked ${alerts.length} active alert(s), triggered $triggeredCount',
-          clearLastError: true,
-          activeAlertsCount: alerts.length,
+          lastError: failedRoutes.isEmpty
+              ? null
+              : 'Some routes could not be refreshed',
+          clearLastError: failedRoutes.isEmpty,
+          activeAlertsCount: remainingCount,
           lastNearestBusDistanceMeters: latestNearest,
           lastRouteBusesCount: latestRouteBusesCount,
           lastTriggeredAlertId: lastTriggeredAlertId,
@@ -174,9 +248,12 @@ class BusAlertBackgroundCheckService {
       );
       return BusAlertCheckResult(
         checkedAt: checkedAt,
-        activeAlertsCount: alerts.length,
+        activeAlertsCount: remainingCount,
         triggeredAlertsCount: triggeredCount,
         routeBusesCount: buses.length,
+        error: failedRoutes.isEmpty
+            ? null
+            : 'Some routes could not be refreshed',
         lastNearestBusDistanceMeters: latestNearest,
       );
     } catch (e) {
@@ -192,7 +269,7 @@ class BusAlertBackgroundCheckService {
       );
       return BusAlertCheckResult(
         checkedAt: checkedAt,
-        activeAlertsCount: 0,
+        activeAlertsCount: activeCount,
         triggeredAlertsCount: 0,
         routeBusesCount: 0,
         error: message,
@@ -201,6 +278,12 @@ class BusAlertBackgroundCheckService {
   }
 
   Future<void> _ensureNotificationsReady() async {
+    if (_notificationsReady) return;
+    if (_prepareNotifications != null) {
+      await _prepareNotifications();
+      _notificationsReady = true;
+      return;
+    }
     final notifications = FlutterLocalNotificationsPlugin();
     await notifications.initialize(
       const InitializationSettings(
@@ -219,5 +302,6 @@ class BusAlertBackgroundCheckService {
         importance: Importance.max,
       ),
     );
+    _notificationsReady = true;
   }
 }

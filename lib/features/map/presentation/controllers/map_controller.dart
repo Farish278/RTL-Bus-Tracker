@@ -17,6 +17,8 @@ import '../../data/background/bus_alert_repository.dart';
 import '../../data/background/foreground_alert_service.dart';
 import '../../data/repositories/map_repository_impl.dart';
 import '../../domain/entities/models.dart';
+import '../../domain/entities/resource_update.dart';
+import '../../data/background/service_live_bridge.dart';
 import '../../domain/repositories/map_repository.dart';
 import '../../domain/services/alert_evaluation_service.dart';
 
@@ -29,6 +31,8 @@ class MapState {
     this.geometries = const [],
     this.liveBuses = const [],
     this.stopEtas = const {},
+    this.resourceStatuses = const {},
+    this.loadingResources = const {},
     this.fitPoints = const [],
     this.fitNonce = 0,
     this.showRoutes = true,
@@ -92,6 +96,8 @@ class MapState {
   final List<RouteGeometry> geometries;
   final List<BusLocation> liveBuses;
   final Map<String, List<StopEta>> stopEtas;
+  final Map<String, ResourceStatus> resourceStatuses;
+  final Set<String> loadingResources;
   final List<LatLng> fitPoints;
   final int fitNonce;
   final bool showRoutes;
@@ -156,6 +162,8 @@ class MapState {
     List<RouteGeometry>? geometries,
     List<BusLocation>? liveBuses,
     Map<String, List<StopEta>>? stopEtas,
+    Map<String, ResourceStatus>? resourceStatuses,
+    Set<String>? loadingResources,
     List<LatLng>? fitPoints,
     int? fitNonce,
     bool? showRoutes,
@@ -243,6 +251,8 @@ class MapState {
       geometries: geometries ?? this.geometries,
       liveBuses: liveBuses ?? this.liveBuses,
       stopEtas: stopEtas ?? this.stopEtas,
+      resourceStatuses: resourceStatuses ?? this.resourceStatuses,
+      loadingResources: loadingResources ?? this.loadingResources,
       fitPoints: fitPoints ?? this.fitPoints,
       fitNonce: fitNonce ?? this.fitNonce,
       showRoutes: showRoutes ?? this.showRoutes,
@@ -379,7 +389,9 @@ class AlertEnableResult {
 }
 
 final mapRepositoryProvider = Provider<MapRepository>((ref) {
-  return MapRepositoryImpl(RtlBusApi(DioClient()));
+  final repository = MapRepositoryImpl(RtlBusApi(DioClient()));
+  ref.onDispose(() => unawaited(repository.dispose()));
+  return repository;
 });
 
 final mapControllerProvider = StateNotifierProvider<MapController, MapState>((
@@ -391,7 +403,9 @@ final mapControllerProvider = StateNotifierProvider<MapController, MapState>((
 });
 
 class MapController extends StateNotifier<MapState> {
-  MapController(this._repo) : super(const MapState());
+  MapController(this._repo) : super(const MapState()) {
+    _resourceSub = _repo.updates.listen(_onResourceUpdate);
+  }
   final MapRepository _repo;
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
@@ -408,7 +422,12 @@ class MapController extends StateNotifier<MapState> {
       'Notifications when a selected bus route is near a selected stop';
   final Map<String, double> _lastBusHeadings = <String, double>{};
   SharedPreferences? _prefs;
-  StreamSubscription<List<BusLocation>>? _liveSub;
+  StreamSubscription<LiveSnapshot>? _liveSub;
+  StreamSubscription<ResourceUpdate>? _resourceSub;
+  Timer? _etaTimer;
+  Set<String> _viewEtaRoutes = {};
+  int _liveRestartRequest = 0;
+  final Map<String, LiveSnapshot> _liveSnapshots = {};
   bool _notificationInitDone = false;
   bool _isEvaluatingAlert = false;
   DateTime _lastAlertCheckThrottleAt = DateTime.fromMillisecondsSinceEpoch(0);
@@ -416,7 +435,7 @@ class MapController extends StateNotifier<MapState> {
   static const _selectedAreaCodePrefKey = 'selected_area_code_v1';
   int _liveWatchGeneration = 0;
   bool _isMapScreenActive = true;
-  bool _isImmediateLiveFetchInFlight = false;
+
   int _staticRefreshGeneration = 0;
 
   Future<void> loadInitial({
@@ -457,15 +476,10 @@ class MapController extends StateNotifier<MapState> {
           selectedRouteCodes.contains(state.selectedStopScheduleRouteCode)
           ? state.selectedStopScheduleRouteCode
           : null;
-      final geometries = selectedRouteCodes.isEmpty
-          ? const <RouteGeometry>[]
-          : await _repo.getRouteGeometry(
-              selectedRouteCodes.toList(),
-              forceRefresh: force,
-            );
-      final stopEtas = selectedRouteCodes.isEmpty
-          ? const <String, List<StopEta>>{}
-          : await _repo.getStopEtasForRoutes(selectedRouteCodes.toList());
+      final geometries = state.geometries
+          .where((g) => selectedRouteCodes.contains(g.routeCode))
+          .toList();
+      final stopEtas = state.stopEtas;
       final scheduleRouteCodes = state.routeSchedules.keys
           .where(routeCodes.contains)
           .toSet();
@@ -499,7 +513,11 @@ class MapController extends StateNotifier<MapState> {
         clearPreviewAlert: true,
         clearActiveAlert: shouldClearActiveAlert,
         isLoading: false,
-        lastSync: DateTime.now(),
+        lastSync: _repo.resourceStatuses['routes']?.fetchedAt,
+        resourceStatuses: {
+          ...state.resourceStatuses,
+          ..._repo.resourceStatuses,
+        },
         offlineNotice: false,
         defaultAlertDistanceMeters: savedDistance,
         scheduleMessage: _scheduleSummaryForSelection(
@@ -510,6 +528,7 @@ class MapController extends StateNotifier<MapState> {
       if (shouldAutoFit) {
         _scheduleFit();
       }
+      unawaited(_loadSelectedResources(force: force));
       await _restartLiveWatch();
       if (shouldClearActiveAlert) {
         if (state.activeAlert != null) {
@@ -580,7 +599,7 @@ class MapController extends StateNotifier<MapState> {
           : (freshAreas.any((a) => a.code == AppConfig.defaultAreaCode)
                 ? AppConfig.defaultAreaCode
                 : (freshAreas.firstOrNull?.code ?? ''));
-      final freshRoutes = await _repo.getRoutes(selected, forceRefresh: true);
+      final freshRoutes = await _repo.getRoutes(selected, forceRefresh: false);
       if (generation != _staticRefreshGeneration) return;
       final routeCodes = freshRoutes.map((r) => r.routeCode).toSet();
       final keptSelected = state.selectedRouteCodes
@@ -591,7 +610,7 @@ class MapController extends StateNotifier<MapState> {
         routes: freshRoutes,
         selectedAreaCode: selected,
         selectedRouteCodes: keptSelected,
-        lastSync: DateTime.now(),
+        lastSync: _repo.resourceStatuses['routes']?.fetchedAt,
         offlineNotice: false,
       );
       DebugLog.throttled(
@@ -622,6 +641,8 @@ class MapController extends StateNotifier<MapState> {
       scheduleMessage: _scheduleSummaryForSelection(routes, const {}),
     );
     _scheduleFit();
+    _repo.cancelUnusedResources({});
+    setViewedEtaRoutes({});
     await _restartLiveWatch();
   }
 
@@ -633,31 +654,172 @@ class MapController extends StateNotifier<MapState> {
       next.add(code);
     }
     DebugLog.info('toggleRoute($code) -> selected=${next.length}');
-    state = state.copyWith(selectedRouteCodes: next, isLoading: true);
+    state = state.copyWith(selectedRouteCodes: next, isLoading: false);
+    _repo.cancelUnusedResources(next);
     if (state.previewAlert != null &&
         !next.contains(state.previewAlert!.routeCode)) {
       state = state.copyWith(clearPreviewAlert: true);
     }
     if (state.activeAlert != null &&
         !next.contains(state.activeAlert!.routeCode)) {
+      final alert = state.activeAlert!;
       state = state.copyWith(clearActiveAlert: true);
-      await _cancelPersistedAlertFor(state.activeAlert!);
+      await _cancelPersistedAlertFor(alert);
       await ForegroundAlertService.reconcileWithStoredAlerts();
     }
     _clearBusesForDeselectedRoutes(next);
     _scheduleFit();
-    final geos = await _repo.getRouteGeometry(next.toList());
-    if (!_sameSelection(next, state.selectedRouteCodes)) return;
-    final etas = await _repo.getStopEtasForRoutes(next.toList());
-    if (!_sameSelection(next, state.selectedRouteCodes)) return;
     state = state.copyWith(
-      geometries: geos,
-      stopEtas: etas,
-      isLoading: false,
+      geometries: state.geometries
+          .where((g) => next.contains(g.routeCode))
+          .toList(),
       scheduleMessage: _scheduleSummaryForSelection(state.routes, next),
     );
-    _scheduleFit();
+    unawaited(_loadSelectedResources());
     await _restartLiveWatch();
+  }
+
+  Future<void> _loadSelectedResources({bool force = false}) async {
+    final codes = state.selectedRouteCodes.toSet();
+    final jobs = <Future<void>>[];
+    for (final code in codes) {
+      final key = 'geometry:$code';
+      state = state.copyWith(
+        loadingResources: {...state.loadingResources, key},
+      );
+      jobs.add(() async {
+        try {
+          final geometries = await _repo.getRouteGeometry([
+            code,
+          ], forceRefresh: force);
+          if (!mounted || !state.selectedRouteCodes.contains(code)) return;
+          state = state.copyWith(
+            geometries: [
+              ...state.geometries.where((g) => g.routeCode != code),
+              ...geometries,
+            ],
+            resourceStatuses: {
+              ...state.resourceStatuses,
+              ..._repo.resourceStatuses,
+            },
+          );
+        } finally {
+          if (mounted) {
+            state = state.copyWith(
+              loadingResources: {...state.loadingResources}..remove(key),
+            );
+          }
+        }
+      }());
+    }
+    jobs.add(_loadEtas(codes.toList(), force: force));
+    await Future.wait(jobs);
+  }
+
+  Future<void> _loadEtas(List<String> codes, {bool force = false}) async {
+    await Future.wait(
+      codes.map((code) async {
+        final key = 'eta:$code';
+        if (mounted) {
+          state = state.copyWith(
+            loadingResources: {...state.loadingResources, key},
+          );
+        }
+        try {
+          await _repo.getStopEtasForRoutes([code], forceRefresh: force);
+          if (mounted) await _applyEtas();
+        } finally {
+          if (mounted) {
+            state = state.copyWith(
+              loadingResources: {...state.loadingResources}..remove(key),
+            );
+          }
+        }
+      }),
+    );
+  }
+
+  Future<void> _applyEtas() async {
+    final codes = state.selectedRouteCodes.union(_viewEtaRoutes);
+    final etas = await _repo.getStopEtasForRoutes(codes.toList());
+    if (mounted &&
+        _sameSelection(codes, state.selectedRouteCodes.union(_viewEtaRoutes))) {
+      state = state.copyWith(
+        stopEtas: etas,
+        resourceStatuses: {
+          ...state.resourceStatuses,
+          ..._repo.resourceStatuses,
+        },
+      );
+    }
+  }
+
+  void setViewedEtaRoutes(Set<String> routes) {
+    _viewEtaRoutes = routes;
+    _etaTimer?.cancel();
+    _etaTimer = null;
+    if (routes.isEmpty || !_isMapScreenActive) return;
+    unawaited(_loadEtas(routes.toList()));
+    _etaTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      unawaited(_loadEtas(_viewEtaRoutes.toList()));
+    });
+  }
+
+  void _onResourceUpdate(ResourceUpdate update) {
+    if (!mounted || update.key.startsWith('live:')) return;
+    state = state.copyWith(
+      resourceStatuses: {...state.resourceStatuses, update.key: update.status},
+    );
+    if (update.status.error != null) return;
+    if (update.key == 'routes') {
+      unawaited(_applyCatalogue());
+    } else if (update.value is RouteGeometry) {
+      final geometry = update.value as RouteGeometry;
+      if (state.selectedRouteCodes.contains(geometry.routeCode)) {
+        state = state.copyWith(
+          geometries: [
+            ...state.geometries.where((g) => g.routeCode != geometry.routeCode),
+            geometry,
+          ],
+        );
+      }
+    } else if (update.key.startsWith('eta:')) {
+      unawaited(_applyEtas());
+    }
+  }
+
+  Future<void> _applyCatalogue() async {
+    final area = state.selectedAreaCode;
+    final areas = await _repo.getAreas();
+    final selected = areas.any((a) => a.code == area)
+        ? area
+        : (areas.firstOrNull?.code ?? '');
+    final routes = await _repo.getRoutes(selected);
+    if (!mounted || state.selectedAreaCode != area) return;
+    final schedules = <String, RouteSchedule>{};
+    for (final code in state.routeSchedules.keys.toList()) {
+      final schedule = await _repo.getRouteSchedule(code);
+      if (schedule != null) schedules[code] = schedule;
+    }
+    if (!mounted || state.selectedAreaCode != area) return;
+    final available = routes.map((r) => r.routeCode).toSet();
+    final kept = state.selectedRouteCodes.intersection(available);
+    final changed = !_sameSelection(kept, state.selectedRouteCodes);
+    state = state.copyWith(
+      areas: areas,
+      routes: routes,
+      selectedAreaCode: selected,
+      selectedRouteCodes: kept,
+      routeSchedules: schedules,
+      lastSync: _repo.resourceStatuses['routes']?.fetchedAt,
+      geometries: state.geometries
+          .where((g) => kept.contains(g.routeCode))
+          .toList(),
+    );
+    if (changed) {
+      _repo.cancelUnusedResources(kept);
+      await _restartLiveWatch();
+    }
   }
 
   bool _sameSelection(Set<String> a, Set<String> b) =>
@@ -685,68 +847,49 @@ class MapController extends StateNotifier<MapState> {
   }
 
   Future<void> _restartLiveWatch() async {
-    await _liveSub?.cancel();
+    final request = ++_liveRestartRequest;
+    final old = _liveSub;
     _liveSub = null;
-    _liveWatchGeneration++;
-    final watchGeneration = _liveWatchGeneration;
-    final selectedCodes = state.selectedRouteCodes.toSet();
-    if (selectedCodes.isEmpty || !_isMapScreenActive) {
-      DebugLog.info(
-        'live watch stopped: selected=${selectedCodes.length}, mapActive=$_isMapScreenActive',
-      );
-      state = state.copyWith(liveBuses: const []);
-      return;
-    }
-    DebugLog.info(
-      'live watch start: routes=${selectedCodes.length}, interval=8s',
-    );
-    unawaited(_fetchLiveBusesImmediately(selectedCodes, watchGeneration));
-    _liveSub = _repo.watchLiveBusLocations(selectedCodes.toList()).listen((
-      buses,
-    ) {
-      if (watchGeneration != _liveWatchGeneration) return;
-      final activeSelected = state.selectedRouteCodes;
-      final filtered = buses
-          .where((bus) => activeSelected.contains(bus.routeCode))
-          .toList();
-      final withDerivedBearing = _applyDerivedBearings(filtered);
-      DebugLog.throttled(
-        'live_watch_update',
-        'live watch update: buses=${withDerivedBearing.length}',
-      );
-      state = state.copyWith(liveBuses: withDerivedBearing);
-      unawaited(_evaluateAlert(withDerivedBearing));
-    });
+    await old?.cancel();
+    if (!mounted || request != _liveRestartRequest) return;
+    final generation = ++_liveWatchGeneration;
+    final codes = state.selectedRouteCodes.toSet();
+    _liveSnapshots.removeWhere((code, _) => !codes.contains(code));
+    if (codes.isEmpty || !_isMapScreenActive) return;
+    _liveSub = ServiceLiveBridge(_repo)
+        .watch(codes.toList())
+        .listen(
+          (snapshot) {
+            if (!mounted ||
+                generation != _liveWatchGeneration ||
+                !state.selectedRouteCodes.contains(snapshot.routeCode)) {
+              return;
+            }
+            _liveSnapshots[snapshot.routeCode] = snapshot;
+            final buses = _liveSnapshots.values.expand((s) => s.buses).toList();
+            state = state.copyWith(
+              liveBuses: _applyDerivedBearings(buses),
+              resourceStatuses: {
+                ...state.resourceStatuses,
+                'live:${snapshot.routeCode}': snapshot.status,
+              },
+            );
+            if (!snapshot.historical &&
+                snapshot.error == null &&
+                !snapshot.metadataOnly) {
+              unawaited(_evaluateFreshAlert(snapshot));
+            }
+          },
+          onError: (Object error) {
+            DebugLog.info('Live stream failed: $error');
+          },
+        );
   }
 
-  Future<void> _fetchLiveBusesImmediately(
-    Set<String> selectedCodes,
-    int watchGeneration,
-  ) async {
-    if (_isImmediateLiveFetchInFlight) return;
-    _isImmediateLiveFetchInFlight = true;
-    final sw = Stopwatch()..start();
-    try {
-      final buses = await _repo.getLiveBusLocations(selectedCodes.toList());
-      if (watchGeneration != _liveWatchGeneration) return;
-      final activeSelected = state.selectedRouteCodes;
-      final filtered = buses
-          .where((bus) => activeSelected.contains(bus.routeCode))
-          .toList();
-      final withDerivedBearing = _applyDerivedBearings(filtered);
-      state = state.copyWith(liveBuses: withDerivedBearing);
-      unawaited(_evaluateAlert(withDerivedBearing));
-      DebugLog.throttled(
-        'live_immediate_fetch',
-        'immediate live fetch buses=${withDerivedBearing.length} took=${sw.elapsedMilliseconds}ms',
-        interval: const Duration(seconds: 2),
-      );
-    } catch (e) {
-      DebugLog.info('immediate live fetch failed: $e');
-    } finally {
-      _isImmediateLiveFetchInFlight = false;
-      sw.stop();
-    }
+  Future<void> _evaluateFreshAlert(LiveSnapshot snapshot) async {
+    // A service-owned snapshot is evaluated in that service, exactly once.
+    if (await ForegroundAlertService.isRunning()) return;
+    if (mounted) await _evaluateAlert(snapshot.buses);
   }
 
   void _clearBusesForDeselectedRoutes(Set<String> nextSelected) {
@@ -807,21 +950,21 @@ class MapController extends StateNotifier<MapState> {
       showStops: stops,
       showBuses: buses,
     );
-    if (buses != null) {
-      DebugLog.info('toggleLayer(showBuses: $buses)');
-      unawaited(_restartLiveWatch());
-    }
   }
 
   void setMapScreenActive(bool active) {
     if (_isMapScreenActive == active) return;
     _isMapScreenActive = active;
     DebugLog.info('setMapScreenActive($active)');
+    setViewedEtaRoutes(_viewEtaRoutes);
     unawaited(_restartLiveWatch());
   }
 
   Future<void> clearCache() async {
     try {
+      await _liveSub?.cancel();
+      _liveSub = null;
+      _liveSnapshots.clear();
       await _repo.clearCache();
       await loadInitial(force: true);
     } catch (e) {
@@ -869,6 +1012,13 @@ class MapController extends StateNotifier<MapState> {
       clearSelectedStopScheduleRouteCode: nextSelectedRouteCode == null,
     );
 
+    if (forceRefresh) {
+      try {
+        await _repo.getRoutes('', forceRefresh: true);
+      } catch (_) {
+        return;
+      }
+    }
     for (final route in routes) {
       final routeCode = route.routeCode;
       final hasCache = state.routeSchedules.containsKey(routeCode);
@@ -884,7 +1034,7 @@ class MapController extends StateNotifier<MapState> {
       try {
         final schedule = await _repo.getRouteSchedule(
           routeCode,
-          forceRefresh: forceRefresh,
+          forceRefresh: false,
         );
         final updatedSchedules = {...state.routeSchedules};
         if (schedule != null) {
@@ -913,6 +1063,7 @@ class MapController extends StateNotifier<MapState> {
     BusRoute route, {
     bool forceRefresh = false,
   }) async {
+    if (!mounted) return;
     if (!forceRefresh && state.routeSchedules.containsKey(route.routeCode)) {
       return;
     }
@@ -930,6 +1081,7 @@ class MapController extends StateNotifier<MapState> {
         route.routeCode,
         forceRefresh: forceRefresh,
       );
+      if (!mounted) return;
       final nextLoading = {...state.loadingScheduleRouteCodes}
         ..remove(route.routeCode);
       final nextSchedules = {...state.routeSchedules};
@@ -940,13 +1092,8 @@ class MapController extends StateNotifier<MapState> {
         loadingScheduleRouteCodes: nextLoading,
         routeSchedules: nextSchedules,
       );
-      if (forceRefresh) {
-        unawaited(() async {
-          await Future<void>.delayed(const Duration(seconds: 2));
-          await loadScheduleForRoute(route);
-        }());
-      }
     } catch (_) {
+      if (!mounted) return;
       final nextLoading = {...state.loadingScheduleRouteCodes}
         ..remove(route.routeCode);
       final nextErrors = {...state.scheduleErrorsByRouteCode};
@@ -1524,6 +1671,7 @@ class MapController extends StateNotifier<MapState> {
     }
     _isEvaluatingAlert = true;
     _lastAlertCheckThrottleAt = now;
+    String? claimedNotification;
     try {
       final evaluation = _alertEvaluationService.evaluateAlerts(
         activeAlerts: [alert],
@@ -1556,8 +1704,18 @@ class MapController extends StateNotifier<MapState> {
         );
         return;
       }
+      final persisted = (await _alertRepository.getActiveAlerts())
+          .firstWhereOrNull(
+            (a) =>
+                a.routeCode == alert.routeCode && a.stopCode == alert.stopCode,
+          );
+      if (persisted == null ||
+          !await _alertRepository.claimNotification(persisted.id)) {
+        return;
+      }
+      claimedNotification = persisted.id;
       await _notifications.show(
-        DateTime.now().millisecondsSinceEpoch.remainder(2147483647),
+        persisted.notificationId,
         'Bus approaching ${alert.stopName}',
         '${alert.routeLabel}: ${bus.busCode.isNotEmpty ? bus.busCode : bus.plateNumber} is within ${alert.distanceThresholdMeters.toInt()}m',
         const NotificationDetails(
@@ -1570,6 +1728,7 @@ class MapController extends StateNotifier<MapState> {
           ),
         ),
       );
+      await _alertRepository.completeNotification(claimedNotification);
       await _markPersistedAlertTriggered(
         alert,
         result.nearestBusDistanceMeters,
@@ -1587,7 +1746,12 @@ class MapController extends StateNotifier<MapState> {
         alertStatusMessage: 'Alert triggered.',
       );
     } catch (e) {
-      state = state.copyWith(notificationError: 'Alert check failed: $e');
+      if (claimedNotification != null) {
+        await _alertRepository.releaseNotification(claimedNotification);
+      }
+      if (mounted) {
+        state = state.copyWith(notificationError: 'Alert check failed: $e');
+      }
     } finally {
       _isEvaluatingAlert = false;
     }
@@ -1806,7 +1970,11 @@ class MapController extends StateNotifier<MapState> {
 
   @override
   void dispose() {
+    _liveRestartRequest++;
+    _liveWatchGeneration++;
     _liveSub?.cancel();
+    _resourceSub?.cancel();
+    _etaTimer?.cancel();
     super.dispose();
   }
 

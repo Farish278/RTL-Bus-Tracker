@@ -1,3 +1,4 @@
+import '../db/cache_db.dart';
 import 'dart:convert';
 
 import 'package:latlong2/latlong.dart';
@@ -247,6 +248,12 @@ class BackgroundAlertStatus {
 }
 
 class BusAlertRepository {
+  Future<bool> claimNotification(String id) =>
+      CacheDb.instance.claimNotification(id);
+  Future<void> completeNotification(String id) =>
+      CacheDb.instance.completeNotification(id);
+  Future<void> releaseNotification(String id) =>
+      CacheDb.instance.releaseNotification(id);
   static const alertsPrefKey = 'active_bus_alerts';
   static const statusPrefKey = 'background_alert_status_v1';
   static const alertBackgroundDisabledPrefKey = 'alert_background_disabled_v1';
@@ -257,8 +264,10 @@ class BusAlertRepository {
   bool _initLogged = false;
 
   Future<SharedPreferences> _prefs() async {
-    if (_sharedPreferences != null) return _sharedPreferences!;
-    return initialize();
+    final preferences = _sharedPreferences ?? await initialize();
+    // Each isolate has its own SharedPreferences cache.
+    await preferences.reload();
+    return preferences;
   }
 
   Future<SharedPreferences> initialize() async {
@@ -385,9 +394,7 @@ class BusAlertRepository {
   }
 
   Future<void> clearAlerts() async {
-    final prefs = await _prefs();
-    DebugLog.info('Clearing stored alerts');
-    await prefs.remove(alertsPrefKey);
+    await _mutateAlerts((_) => []);
     final status = await getStatus();
     await saveStatus(
       status.copyWith(
@@ -425,35 +432,38 @@ class BusAlertRepository {
     DebugLog.info('Stored active alerts count after save: $active');
   }
 
-  Future<void> upsertAlert(PersistedBusAlert alert) async {
-    DebugLog.info('Alert save attempt id=${alert.id}');
-    final alerts = await getAlerts();
-    final next = <PersistedBusAlert>[
-      ...alerts.where((a) => a.id != alert.id),
-      alert,
-    ];
-    await saveAlerts(next);
-    DebugLog.info('Alert save success id=${alert.id}');
+  Future<void> _mutateAlerts(
+    List<PersistedBusAlert> Function(List<PersistedBusAlert>) change,
+  ) async {
+    // Serialize read/modify/write across UI and service isolates. Preferences
+    // are reloaded under the SQLite write lock before deriving the new list.
+    await (await CacheDb.instance.db).transaction((txn) async {
+      await saveAlerts(change(await getAlerts()));
+    });
   }
+
+  Future<void> upsertAlert(PersistedBusAlert alert) => _mutateAlerts(
+    (alerts) => [...alerts.where((a) => a.id != alert.id), alert],
+  );
 
   Future<void> saveAlert(PersistedBusAlert alert) => upsertAlert(alert);
 
   Future<void> updateAlert(PersistedBusAlert alert) => upsertAlert(alert);
 
   Future<void> markAlertCancelled(String alertId) async {
-    final alerts = await getAlerts();
-    final next = alerts
-        .map(
-          (a) => a.id == alertId
-              ? a.copyWith(
-                  enabled: false,
-                  triggered: false,
-                  clearLastNearestBusDistanceMeters: true,
-                )
-              : a,
-        )
-        .toList();
-    await saveAlerts(next);
+    await _mutateAlerts(
+      (alerts) => alerts
+          .map(
+            (a) => a.id == alertId
+                ? a.copyWith(
+                    enabled: false,
+                    triggered: false,
+                    clearLastNearestBusDistanceMeters: true,
+                  )
+                : a,
+          )
+          .toList(),
+    );
   }
 
   Future<void> cancelAlert(String alertId) => markAlertCancelled(alertId);

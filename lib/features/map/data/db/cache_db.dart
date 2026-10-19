@@ -1,30 +1,84 @@
 import 'dart:convert';
+import 'cache_store.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
-class CacheDb {
+class CacheDb implements CacheStore {
   CacheDb._();
   static final instance = CacheDb._();
   Database? _db;
+  Future<Database>? _opening;
   DateTime? _lastCacheReadAt;
   DateTime? _lastCacheWriteAt;
   String? _lastCacheError;
 
   Future<Database> get db async {
     if (_db != null) return _db!;
+    try {
+      return await (_opening ??= _open());
+    } catch (_) {
+      _opening = null;
+      rethrow;
+    }
+  }
+
+  Future<Database> _open() async {
     final path = p.join(await getDatabasesPath(), 'rtl_bus_cache.db');
     _db = await openDatabase(
       path,
-      version: 1,
+      version: 2,
+      onUpgrade: (db, oldVersion, newVersion) async {
+        await _createNotificationClaims(db);
+      },
       onCreate: (db, version) async {
         await db.execute(
           'CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, updatedAt INTEGER NOT NULL)',
         );
+        await _createNotificationClaims(db);
       },
     );
     return _db!;
   }
 
+  static Future<void> _createNotificationClaims(Database db) => db.execute(
+    'CREATE TABLE IF NOT EXISTS notification_claims (id TEXT PRIMARY KEY, claimedAt INTEGER NOT NULL, sent INTEGER NOT NULL DEFAULT 0)',
+  );
+  Future<bool> claimNotification(String id) async {
+    final database = await db;
+    return database.transaction((txn) async {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await txn.delete(
+        'notification_claims',
+        where: 'id = ? AND sent = 0 AND claimedAt < ?',
+        whereArgs: [id, now - 30000],
+      );
+      await txn.rawInsert(
+        'INSERT OR IGNORE INTO notification_claims (id, claimedAt, sent) VALUES (?, ?, 0)',
+        [id, now],
+      );
+      return (await txn.rawQuery('SELECT changes() AS count')).first['count'] ==
+          1;
+    });
+  }
+
+  Future<void> completeNotification(String id) async {
+    await (await db).update(
+      'notification_claims',
+      {'sent': 1},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<void> releaseNotification(String id) async {
+    await (await db).delete(
+      'notification_claims',
+      where: 'id = ? AND sent = 0',
+      whereArgs: [id],
+    );
+  }
+
+  @override
   Future<void> put(String key, Object value) async {
     try {
       final database = await db;
@@ -41,6 +95,7 @@ class CacheDb {
     }
   }
 
+  @override
   Future<Map<String, dynamic>?> get(String key) async {
     try {
       final database = await db;
@@ -71,6 +126,7 @@ class CacheDb {
     };
   }
 
+  @override
   Future<void> clear() async {
     final database = await db;
     await database.delete('kv');
@@ -82,9 +138,7 @@ class CacheDb {
         .where((k) => k.startsWith('geometry:'))
         .length;
     final stopEtaCount = entries.keys.where((k) => k.startsWith('eta:')).length;
-    final latestSyncMs = entries.values.isEmpty
-        ? null
-        : entries.values.reduce((a, b) => a > b ? a : b);
+    final latestSyncMs = entries['routes'];
     return {
       'cacheEntries': entries.length,
       'geometryCacheCount': selectedRoutesCount,

@@ -8,6 +8,11 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import '../../../../core/utils/debug_log.dart';
 import 'bus_alert_background_check_service.dart';
 import 'bus_alert_repository.dart';
+import '../../../../core/network/dio_client.dart';
+import '../../../../core/network/request_scheduler.dart';
+import '../api/rtl_bus_api.dart';
+import '../repositories/map_repository_impl.dart';
+import '../../domain/entities/resource_update.dart';
 
 class ForegroundAlertService {
   static const int serviceNotificationId = 445001;
@@ -81,6 +86,7 @@ class ForegroundAlertService {
   static Future<bool> ensureRunning() async {
     try {
       DebugLog.info('RTLBusAlertService service start requested');
+      await RequestScheduler.shared.reserveForService();
       await initialize();
       if (await _service.isRunning()) {
         DebugLog.info('RTLBusAlertService service already running');
@@ -91,6 +97,7 @@ class ForegroundAlertService {
         return true;
       }
       final started = await _service.startService();
+      if (!started) RequestScheduler.shared.limit = 4;
       DebugLog.info(
         'RTLBusAlertService service start ${started ? 'success' : 'failure'}',
       );
@@ -171,19 +178,35 @@ Future<void> foregroundServiceEntryPoint(ServiceInstance service) async {
   DebugLog.info('RTLBusAlertService service onStart entered');
 
   final repository = BusAlertRepository();
-  final checker = BusAlertBackgroundCheckService(repository: repository);
+  RequestScheduler.shared.limit = 2;
+  final liveRepository = MapRepositoryImpl(RtlBusApi(DioClient()));
+  final checker = BusAlertBackgroundCheckService(
+    repository: repository,
+    liveFetcher: liveRepository.getCoordinatesForAlert,
+  );
+  final views = <String, ({List<String> routes, DateTime seen})>{};
+  final polls = <String, StreamSubscription<LiveSnapshot>>{};
+  final latest = <String, LiveSnapshot>{};
+  var stopped = false;
+  Timer? timer;
+  Timer? leaseTimer;
+  final eventSubscriptions = <StreamSubscription<dynamic>>[];
   var isChecking = false;
+  late Future<void> Function() stop;
 
-  Future<void> runCheck(String source) async {
+  Future<void> runCheck(String source, {Set<String>? routeCodes}) async {
     if (isChecking) return;
     isChecking = true;
     DebugLog.info('RTLBusAlertService service tick start source=$source');
     try {
-      final result = await checker.runOnce(source: source);
+      final result = await checker.runOnce(
+        source: source,
+        routeCodes: routeCodes,
+      );
       DebugLog.info(
         'RTLBusAlertService service tick end source=$source active=${result.activeAlertsCount} triggered=${result.triggeredAlertsCount} error=${result.error ?? 'none'}',
       );
-      if (result.activeAlertsCount == 0) {
+      if ((await repository.getActiveAlerts()).isEmpty) {
         DebugLog.info(
           'RTLBusAlertService service stopped due to no active alerts',
         );
@@ -196,7 +219,7 @@ Future<void> foregroundServiceEntryPoint(ServiceInstance service) async {
             clearLastError: true,
           ),
         );
-        service.stopSelf();
+        await stop();
       }
     } catch (e) {
       DebugLog.info('RTLBusAlertService service error: $e');
@@ -214,6 +237,92 @@ Future<void> foregroundServiceEntryPoint(ServiceInstance service) async {
     }
   }
 
+  Future<void> reconcileViews() async {
+    if (stopped) return;
+    final now = DateTime.now();
+    views.removeWhere(
+      (_, view) => now.difference(view.seen) > const Duration(seconds: 15),
+    );
+    final routes = views.values.expand((view) => view.routes).toSet();
+    for (final code in polls.keys.toList()) {
+      if (!routes.contains(code)) {
+        final subscription = polls.remove(code);
+        await subscription?.cancel();
+      }
+    }
+    for (final code in routes) {
+      polls.putIfAbsent(
+        code,
+        () => liveRepository.watchLiveSnapshots([code]).listen((snapshot) {
+          latest[code] = snapshot;
+          for (final entry in views.entries) {
+            if (entry.value.routes.contains(code)) {
+              service.invoke('live_snapshot', {
+                'id': entry.key,
+                'snapshot': snapshot.toJson(),
+              });
+            }
+          }
+          if (!snapshot.historical &&
+              snapshot.error == null &&
+              !snapshot.metadataOnly) {
+            unawaited(
+              runCheck(
+                'fresh_map_coordinates',
+                routeCodes: {snapshot.routeCode},
+              ),
+            );
+          }
+        }),
+      );
+    }
+  }
+
+  stop = () async {
+    if (stopped) return;
+    stopped = true;
+    timer?.cancel();
+    leaseTimer?.cancel();
+    for (final subscription in polls.values) {
+      await subscription.cancel();
+    }
+    for (final subscription in eventSubscriptions) {
+      unawaited(subscription.cancel());
+    }
+    await liveRepository.dispose();
+    await service.stopSelf();
+  };
+  eventSubscriptions.add(
+    service.on('live_watch').listen((message) {
+      if (message == null || stopped) return;
+      final id = message['id'] as String;
+      final routes = List<String>.from(message['routes'] as List);
+      final isNew = !views.containsKey(id);
+      views[id] = (routes: routes, seen: DateTime.now());
+      if (isNew) {
+        for (final code in routes) {
+          final snapshot = latest[code];
+          if (snapshot != null) {
+            // Replayed snapshots are display-only and cannot trigger alerts.
+            final json = snapshot.toJson()..['historical'] = true;
+            service.invoke('live_snapshot', {'id': id, 'snapshot': json});
+          }
+        }
+      }
+      unawaited(reconcileViews());
+    }),
+  );
+  eventSubscriptions.add(
+    service.on('live_unwatch').listen((message) {
+      if (message != null) views.remove(message['id']);
+      unawaited(reconcileViews());
+    }),
+  );
+  leaseTimer = Timer.periodic(
+    const Duration(seconds: 3),
+    (_) => unawaited(reconcileViews()),
+  );
+
   if (service is AndroidServiceInstance) {
     service.setAsForegroundService();
     service.setForegroundNotificationInfo(
@@ -223,16 +332,16 @@ Future<void> foregroundServiceEntryPoint(ServiceInstance service) async {
     DebugLog.info('RTLBusAlertService persistent notification shown');
   }
 
-  service.on('run_now').listen((_) {
-    unawaited(runCheck('foreground_service_manual'));
-  });
-  service.on('stop_service').listen((_) async {
-    if (service is AndroidServiceInstance) {
-      service.stopSelf();
-    } else {
-      service.stopSelf();
-    }
-  });
+  eventSubscriptions.add(
+    service.on('run_now').listen((_) {
+      unawaited(runCheck('foreground_service_manual'));
+    }),
+  );
+  eventSubscriptions.add(
+    service.on('stop_service').listen((_) {
+      unawaited(stop());
+    }),
+  );
 
   final status = await repository.getStatus();
   await repository.saveStatus(
@@ -245,8 +354,9 @@ Future<void> foregroundServiceEntryPoint(ServiceInstance service) async {
   );
 
   await runCheck('foreground_service_startup');
+  if (stopped) return;
   DebugLog.info('RTLBusAlertService service timer started');
-  Timer.periodic(ForegroundAlertService.pollInterval, (_) {
+  timer = Timer.periodic(ForegroundAlertService.pollInterval, (_) {
     unawaited(runCheck('foreground_service_periodic'));
   });
 }

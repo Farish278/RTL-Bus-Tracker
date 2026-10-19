@@ -4,19 +4,31 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 enum AccentTheme { system, rtlDefault, blue, green, purple, rose, orange }
 
+/// How much route information the map UI shows.
+/// [minimal] shows route numbers only; [informative] adds origin/destination
+/// so riders unfamiliar with route numbers can still find their bus.
+enum UiDetailLevel { minimal, informative }
+
 class ThemeSettings {
   const ThemeSettings({
     this.mode = ThemeMode.system,
     this.accent = AccentTheme.rtlDefault,
+    this.detailLevel = UiDetailLevel.informative,
   });
 
   final ThemeMode mode;
   final AccentTheme accent;
+  final UiDetailLevel detailLevel;
 
-  ThemeSettings copyWith({ThemeMode? mode, AccentTheme? accent}) {
+  ThemeSettings copyWith({
+    ThemeMode? mode,
+    AccentTheme? accent,
+    UiDetailLevel? detailLevel,
+  }) {
     return ThemeSettings(
       mode: mode ?? this.mode,
       accent: accent ?? this.accent,
+      detailLevel: detailLevel ?? this.detailLevel,
     );
   }
 }
@@ -28,11 +40,21 @@ class ThemeModeController extends StateNotifier<ThemeSettings> {
 
   static const _kThemeMode = 'theme_mode';
   static const _kAccentTheme = 'accent_theme';
+  static const _kDetailLevel = 'ui_detail_level';
+
+  Future<void> setDetailLevel(UiDetailLevel level) async {
+    state = state.copyWith(detailLevel: level);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kDetailLevel, level.name);
+  }
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
     final modeValue = prefs.getString(_kThemeMode);
     final accentValue = prefs.getString(_kAccentTheme);
+    final detailLevel = prefs.getString(_kDetailLevel) == 'minimal'
+        ? UiDetailLevel.minimal
+        : UiDetailLevel.informative;
 
     final mode = switch (modeValue) {
       'light' => ThemeMode.light,
@@ -50,7 +72,7 @@ class ThemeModeController extends StateNotifier<ThemeSettings> {
       _ => AccentTheme.rtlDefault,
     };
 
-    state = ThemeSettings(mode: mode, accent: accent);
+    state = ThemeSettings(mode: mode, accent: accent, detailLevel: detailLevel);
   }
 
   Future<void> setMode(ThemeMode mode) async {
@@ -91,4 +113,8 @@ final themeModeProvider = Provider<ThemeMode>((ref) {
 
 final accentThemeProvider = Provider<AccentTheme>((ref) {
   return ref.watch(themeSettingsProvider).accent;
+});
+
+final uiDetailLevelProvider = Provider<UiDetailLevel>((ref) {
+  return ref.watch(themeSettingsProvider).detailLevel;
 });

@@ -90,6 +90,32 @@ class BusLocation {
   final String? destination;
   final String? nextStop;
   final String? tripDirection;
+  Map<String, dynamic> toJson() => {
+    'routeCode': routeCode,
+    'busCode': busCode,
+    'plateNumber': plateNumber,
+    'lat': point.latitude,
+    'lng': point.longitude,
+    'heading': heading,
+    'direction': direction,
+    'destination': destination,
+    'nextStop': nextStop,
+    'tripDirection': tripDirection,
+  };
+  factory BusLocation.fromJson(Map<String, dynamic> json) => BusLocation(
+    routeCode: json['routeCode'] as String,
+    busCode: json['busCode'] as String,
+    plateNumber: json['plateNumber'] as String,
+    point: LatLng(
+      (json['lat'] as num).toDouble(),
+      (json['lng'] as num).toDouble(),
+    ),
+    heading: (json['heading'] as num?)?.toDouble(),
+    direction: json['direction'] as String?,
+    destination: json['destination'] as String?,
+    nextStop: json['nextStop'] as String?,
+    tripDirection: json['tripDirection'] as String?,
+  );
 }
 
 class StopEta {

@@ -54,3 +54,8 @@ window_dump*.xml
 
 # Local screenshots
 rtl_screen*.png
+
+# Workspace-local validation tools
+/.cache/
+/.flutter
+/.flutter_tool_state

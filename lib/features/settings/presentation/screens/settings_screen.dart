@@ -4,6 +4,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../../core/config/app_config.dart';
 import '../../../map/data/db/cache_db.dart';
+import '../../../map/data/db/map_tile_cache.dart';
+import '../../../../core/network/network_metrics.dart';
 import '../../../map/presentation/controllers/map_controller.dart';
 import '../controllers/theme_mode_controller.dart';
 
@@ -24,6 +26,47 @@ class SettingsScreen extends ConsumerWidget {
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
+          Card(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(18),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Map display',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  SegmentedButton<UiDetailLevel>(
+                    segments: const [
+                      ButtonSegment(
+                        value: UiDetailLevel.minimal,
+                        icon: Icon(Icons.short_text),
+                        label: Text('Minimal'),
+                      ),
+                      ButtonSegment(
+                        value: UiDetailLevel.informative,
+                        icon: Icon(Icons.info_outline),
+                        label: Text('Informative'),
+                      ),
+                    ],
+                    selected: {themeSettings.detailLevel},
+                    onSelectionChanged: (s) => theme.setDetailLevel(s.first),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    themeSettings.detailLevel == UiDetailLevel.minimal
+                        ? 'Shows route numbers only. Best if you already know your routes.'
+                        : 'Shows where each route starts and ends, with extra hints. Best if you are new to the bus network.',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ),
           Card(
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(18),
@@ -127,8 +170,57 @@ class SettingsScreen extends ConsumerWidget {
           OutlinedButton.icon(
             onPressed: c.clearCache,
             icon: const Icon(Icons.delete_sweep),
-            label: const Text('Clear cache'),
+            label: const Text('Clear transit cache'),
           ),
+          const SizedBox(height: 8),
+          FutureBuilder<Map<String, Object?>>(
+            future: MapTileCache.instance.diagnostics(),
+            builder: (context, snapshot) {
+              final data = snapshot.data;
+              final mb = ((data?['bytes'] as int? ?? 0) / 1000000)
+                  .toStringAsFixed(1);
+              return ListTile(
+                title: const Text('Map tile cache'),
+                subtitle: Text(
+                  '$mb MB · 1 GB soft limit · Viewed areas only\nHits: ${data?['hits'] ?? 0} · Misses: ${data?['misses'] ?? 0}',
+                ),
+                trailing: IconButton(
+                  tooltip: 'Clear map cache',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () async {
+                    try {
+                      await MapTileCache.instance.clear();
+                    } catch (_) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Unable to clear map cache. Please retry.',
+                            ),
+                          ),
+                        );
+                      }
+                      return;
+                    }
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Map cache cleared')),
+                      );
+                    }
+                  },
+                ),
+              );
+            },
+          ),
+          if (kDebugMode)
+            ...NetworkMetrics.shared.endpoints.entries.map(
+              (entry) => ListTile(
+                title: Text(entry.key),
+                subtitle: Text(
+                  'Requests: ${entry.value.requests} · Errors: ${entry.value.failures} · Cancelled: ${entry.value.cancellations}\nServer Content-Length bytes: ${entry.value.contentLengthBytes} · Decoded bytes: ${entry.value.decodedBytes}',
+                ),
+              ),
+            ),
           if (kDebugMode) ...[
             const SizedBox(height: 12),
             Card(

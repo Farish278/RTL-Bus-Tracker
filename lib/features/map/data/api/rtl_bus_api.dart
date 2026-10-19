@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'package:dio/dio.dart';
+import '../../../../core/network/request_scheduler.dart';
 import 'package:latlong2/latlong.dart';
 import '../../../../core/network/dio_client.dart';
 import '../../../../core/utils/text_sanitizer.dart';
@@ -10,8 +12,11 @@ class RtlBusApi {
 
   Dio get _dio => _client.dio;
 
-  Future<List<BusRoute>> fetchRoutes() async {
-    final r = await _dio.get('/booking/v2/bus/routedetails');
+  Future<List<BusRoute>> fetchRoutes({CancelToken? cancelToken}) async {
+    final r = await _request(
+      '/booking/v2/bus/routedetails',
+      cancelToken: cancelToken,
+    );
     final male = (r.data['routeResponse'] as List? ?? <dynamic>[])
         .map((e) => _toRoute(e, AreaType.greaterMale))
         .toList();
@@ -68,10 +73,14 @@ class RtlBusApi {
     );
   }
 
-  Future<RouteGeometry> fetchGeometry(String routeCode) async {
-    final r = await _dio.post(
+  Future<RouteGeometry> fetchGeometry(
+    String routeCode, {
+    CancelToken? cancelToken,
+  }) async {
+    final r = await _request(
       '/booking/v2/bus/roadshape',
       data: {'routeCode': routeCode},
+      cancelToken: cancelToken,
     );
     final raw = r.data['roadShape'];
     final features = (raw?['features'] as List? ?? <dynamic>[]);
@@ -95,13 +104,18 @@ class RtlBusApi {
     return RouteGeometry(routeCode: routeCode, points: points);
   }
 
-  Future<List<BusLocation>> fetchLive(String routeCode) async {
-    final r = await _dio.post(
+  Future<List<BusLocation>> fetchLiveCoordinates(
+    String routeCode, {
+    CancelToken? cancelToken,
+  }) async {
+    final r = await _request(
       '/booking/v1/bus/livecoordinates',
+      priority: 0,
       data: {'routeCode': routeCode},
+      cancelToken: cancelToken,
     );
     final list = (r.data['busList'] as List? ?? <dynamic>[]);
-    final v1 = list
+    final buses = list
         .map(
           (e) => BusLocation(
             routeCode: routeCode,
@@ -121,10 +135,41 @@ class RtlBusApi {
         )
         .toList();
 
+    return buses;
+  }
+
+  bool needsEnrichment(List<BusLocation> buses) => buses.any(
+    (bus) =>
+        bus.heading == null ||
+        bus.direction == null ||
+        bus.destination == null ||
+        bus.nextStop == null ||
+        bus.tripDirection == null,
+  );
+
+  Future<List<BusLocation>> fetchLive(
+    String routeCode, {
+    CancelToken? cancelToken,
+  }) async {
+    final coordinates = await fetchLiveCoordinates(
+      routeCode,
+      cancelToken: cancelToken,
+    );
+    return enrichLive(routeCode, coordinates, cancelToken: cancelToken);
+  }
+
+  Future<List<BusLocation>> enrichLive(
+    String routeCode,
+    List<BusLocation> v1, {
+    CancelToken? cancelToken,
+  }) async {
+    if (!needsEnrichment(v1)) return v1;
     try {
-      final v3 = await _dio.post(
+      final v3 = await _request(
         '/booking/v3/bus/livedata',
+        priority: 2,
         data: {'routeCode': routeCode},
+        cancelToken: cancelToken,
       );
       final raw = (v3.data['busList'] as List? ?? <dynamic>[]);
       if (raw.isEmpty) return v1;
@@ -158,15 +203,22 @@ class RtlBusApi {
               _asText(extra['inboundOutbound']),
         );
       }).toList();
+    } on DioException catch (error) {
+      if (CancelToken.isCancel(error)) rethrow;
+      return v1;
     } catch (_) {
       return v1;
     }
   }
 
-  Future<Map<String, List<StopEta>>> fetchStopEtas(String routeCode) async {
-    final r = await _dio.post(
+  Future<Map<String, List<StopEta>>> fetchStopEtas(
+    String routeCode, {
+    CancelToken? cancelToken,
+  }) async {
+    final r = await _request(
       '/gps-engine/eta/all-stops-of-route',
       data: {'routeCode': routeCode},
+      cancelToken: cancelToken,
     );
     final out = <String, List<StopEta>>{};
     _parseEtaList(out, routeCode, 'inbound', r.data['inboundStopsETAList']);
@@ -207,6 +259,24 @@ class RtlBusApi {
             ),
           );
     }
+  }
+
+  Future<Response<dynamic>> _request(
+    String path, {
+    Object? data,
+    CancelToken? cancelToken,
+    int priority = 1,
+  }) {
+    return RequestScheduler.shared.run(
+      () => _dio.request<dynamic>(
+        path,
+        data: data,
+        cancelToken: cancelToken,
+        options: Options(method: data == null ? 'GET' : 'POST'),
+      ),
+      priority: priority,
+      cancelToken: cancelToken,
+    );
   }
 
   String? _asText(dynamic v) {

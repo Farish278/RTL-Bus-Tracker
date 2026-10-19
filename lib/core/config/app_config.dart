@@ -5,5 +5,5 @@ class AppConfig {
   static const defaultAreaName = "Greater Male'";
   static const defaultLat = 4.1755;
   static const defaultLng = 73.5093;
-  static const appVersion = '1.0.0+1';
+  static const appVersion = '1.1.0+2';
 }

@@ -1,7 +1,7 @@
 import 'dart:math' as math;
+import 'dart:async';
 
 import 'package:collection/collection.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart' as fm;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -11,8 +11,12 @@ import 'package:latlong2/latlong.dart';
 import '../../../../core/config/app_config.dart';
 import '../../../../core/utils/debug_log.dart';
 import '../../domain/entities/models.dart';
+import '../../data/db/map_tile_cache.dart';
 import '../controllers/map_controller.dart';
 import '../widgets/layer_toggle_chip.dart';
+import '../widgets/basemap_layer.dart';
+import '../widgets/collapsible_map_details.dart';
+import '../../../settings/presentation/controllers/theme_mode_controller.dart';
 
 const bool _forceMapPlaceholder = bool.fromEnvironment(
   'RTL_FORCE_MAP_PLACEHOLDER',
@@ -28,11 +32,6 @@ class MapScreen extends ConsumerStatefulWidget {
 
 class _MapScreenState extends ConsumerState<MapScreen>
     with WidgetsBindingObserver {
-  static const String _lightTileUrl =
-      'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-  static const String _darkTileUrl =
-      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
-  static const List<String> _cartoSubdomains = ['a', 'b', 'c', 'd'];
   final fm.MapController _mapController = fm.MapController();
   int _lastFitNonce = -1;
   BusStop? _selectedStop;
@@ -43,17 +42,35 @@ class _MapScreenState extends ConsumerState<MapScreen>
   DateTime _lastFollowMoveAt = DateTime.fromMillisecondsSinceEpoch(0);
   ProviderSubscription<MapState>? _stateSub;
   final ScrollController _routeChipsScrollController = ScrollController();
+  String? _detailsRouteCode;
   String _routeStopSearch = '';
   final Map<String, String?> _selectedDirectionByRoute = {};
   final Map<String, bool> _expandedStopScheduleByKey = {};
   final Map<String, bool> _expandedRouteStopTimesByKey = {};
   Object? _mapBuildError;
+  late final fm.NetworkTileProvider _tileProvider = fm.NetworkTileProvider(
+    cachingProvider: MapTileCache.instance,
+    attemptDecodeOfHttpErrorResponses: false,
+  );
+  Timer? _freshnessTimer;
+  List<BusRoute>? _indexedRoutes;
+  Set<String>? _indexedSelection;
+  Map<String, List<BusRoute>> _stopsByCode = {};
+  List<RouteGeometry>? _indexedGeometry;
+  List<RouteGeometry> _validGeometry = [];
+  Widget? _staticRoutes;
+  Widget? _staticStops;
+  ColorScheme? _staticScheme;
+  List<BusRoute>? _routeColorSource;
   static const Color _stableRouteFallbackColor = Color(0xFF1565C0);
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _freshnessTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (mounted) setState(() {});
+    });
     ref.read(mapControllerProvider.notifier).setMapScreenActive(true);
     _stateSub = ref.listenManual<MapState>(mapControllerProvider, (prev, next) {
       final previousAreaCode = prev?.selectedAreaCode;
@@ -64,6 +81,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
           _selectedBusKey = null;
           _isFollowingSelectedBus = false;
           _lastFollowPoint = null;
+          _detailsRouteCode = null;
           _routeStopSearch = '';
           _selectedDirectionByRoute.clear();
           _expandedStopScheduleByKey.clear();
@@ -81,13 +99,16 @@ class _MapScreenState extends ConsumerState<MapScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final active = state == AppLifecycleState.resumed;
+    final active =
+        state == AppLifecycleState.resumed &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
     ref.read(mapControllerProvider.notifier).setMapScreenActive(active);
   }
 
   @override
   void dispose() {
     _stateSub?.close();
+    _freshnessTimer?.cancel();
     _routeChipsScrollController.dispose();
     WidgetsBinding.instance.removeObserver(this);
     ref.read(mapControllerProvider.notifier).setMapScreenActive(false);
@@ -106,22 +127,63 @@ class _MapScreenState extends ConsumerState<MapScreen>
     if (_selectedBusKey != null && selectedBus == null) {
       _isFollowingSelectedBus = false;
     }
-    final primaryRoute = selectedRoutes.firstOrNull;
+    final primaryRoute =
+        selectedRoutes.firstWhereOrNull(
+          (route) => route.routeCode == _detailsRouteCode,
+        ) ??
+        selectedRoutes.firstOrNull;
     final isDark = Theme.of(context).brightness == Brightness.dark;
-    final stopsByCode = <String, List<BusRoute>>{};
-
-    for (final route in selectedRoutes) {
-      for (final stop in route.stops) {
-        stopsByCode.putIfAbsent(stop.code, () => <BusRoute>[]).add(route);
+    if (!identical(_indexedRoutes, state.routes) ||
+        !identical(_indexedSelection, state.selectedRouteCodes)) {
+      _indexedRoutes = state.routes;
+      _indexedSelection = state.selectedRouteCodes;
+      _stopsByCode = {};
+      _staticStops = null;
+      for (final route in selectedRoutes) {
+        for (final stop in route.stops) {
+          _stopsByCode.putIfAbsent(stop.code, () => []).add(route);
+        }
       }
     }
-
+    final stopsByCode = _stopsByCode;
+    if (!identical(_indexedGeometry, state.geometries)) {
+      _indexedGeometry = state.geometries;
+      _staticRoutes = null;
+      _validGeometry = state.geometries
+          .map(
+            (g) => RouteGeometry(
+              routeCode: g.routeCode,
+              points: g.points.where(_isValidPoint).toList(),
+            ),
+          )
+          .where((g) => g.points.isNotEmpty)
+          .toList();
+    }
+    if (_staticScheme != scheme ||
+        !identical(_routeColorSource, state.routes)) {
+      _staticRoutes = null;
+      _staticStops = null;
+      _staticScheme = scheme;
+      _routeColorSource = state.routes;
+    }
     if (_lastFitNonce != state.fitNonce) {
       _lastFitNonce = state.fitNonce;
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => _fitPoints(state.fitPoints),
       );
     }
+    final isInformative =
+        ref.watch(uiDetailLevelProvider) == UiDetailLevel.informative;
+    final detailsKey = _selectedStop != null
+        ? 'stop:${_selectedStop!.code}'
+        : selectedBus != null
+        ? 'bus:${_busKey(selectedBus)}'
+        : primaryRoute != null
+        ? 'routes'
+        : null;
+    final selectionKey = detailsKey == null
+        ? null
+        : '${state.selectedAreaCode}:${state.selectedRouteCodes.join(',')}:$detailsKey';
 
     return Scaffold(
       body: Stack(
@@ -157,27 +219,13 @@ class _MapScreenState extends ConsumerState<MapScreen>
                       },
                     ),
                     children: [
-                      fm.TileLayer(
-                        urlTemplate: _lightTileUrl,
-                        userAgentPackageName: 'com.farish278.rtl_bus_tracker',
-                      ),
-                      if (isDark)
-                        fm.TileLayer(
-                          urlTemplate: _darkTileUrl,
-                          subdomains: _cartoSubdomains,
-                          fallbackUrl: _lightTileUrl,
-                          userAgentPackageName: 'com.farish278.rtl_bus_tracker',
-                          errorTileCallback: _onDarkTileError,
-                        ),
+                      BasemapLayer(isDark: isDark, tileProvider: _tileProvider),
                       if (state.showRoutes)
-                        fm.PolylineLayer(
-                          polylines: state.geometries
-                              .where((g) => g.points.isNotEmpty)
+                        (_staticRoutes ??= fm.PolylineLayer(
+                          polylines: _validGeometry
                               .map(
                                 (g) => fm.Polyline(
-                                  points: g.points
-                                      .where(_isValidPoint)
-                                      .toList(),
+                                  points: g.points,
                                   strokeWidth: isDark ? 5.8 : 4.5,
                                   color: _colorFor(g.routeCode, state.routes),
                                   borderStrokeWidth: isDark ? 2.0 : 1.2,
@@ -187,14 +235,14 @@ class _MapScreenState extends ConsumerState<MapScreen>
                                 ),
                               )
                               .toList(),
-                        ),
+                        )),
                       if (state.activeAlert != null ||
                           state.previewAlert != null)
                         fm.CircleLayer(
                           circles: _buildAlertCircles(state, scheme),
                         ),
                       if (state.showStops)
-                        fm.MarkerLayer(
+                        (_staticStops ??= fm.MarkerLayer(
                           markers: stopsByCode.entries.map((entry) {
                             final stop = entry.value.first.stops.firstWhere(
                               (s) => s.code == entry.key,
@@ -227,11 +275,17 @@ class _MapScreenState extends ConsumerState<MapScreen>
                                       c.previewStopAlert(
                                         route: previewRoute,
                                         stop: stop,
-                                        thresholdMeters:
-                                            state.defaultAlertDistanceMeters,
+                                        thresholdMeters: ref
+                                            .read(mapControllerProvider)
+                                            .defaultAlertDistanceMeters,
                                       );
                                     }
                                   });
+                                  c.setViewedEtaRoutes(
+                                    servingRoutes
+                                        .map((r) => r.routeCode)
+                                        .toSet(),
+                                  );
                                   c.loadSchedulesForStop(stop, servingRoutes);
                                 },
                                 child: Container(
@@ -269,7 +323,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
                               ),
                             );
                           }).toList(),
-                        ),
+                        )),
                       if (state.showBuses)
                         fm.MarkerLayer(
                           markers: state.liveBuses
@@ -291,6 +345,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
                                   point: b.point,
                                   child: GestureDetector(
                                     onTap: () => setState(() {
+                                      c.setViewedEtaRoutes({});
                                       _selectedStop = null;
                                       _selectedBusKey = _busKey(b);
                                       _isFollowingSelectedBus = true;
@@ -398,7 +453,6 @@ class _MapScreenState extends ConsumerState<MapScreen>
                           const fm.TextSourceAttribution(
                             'OpenStreetMap contributors',
                           ),
-                          if (isDark) const fm.TextSourceAttribution('CARTO'),
                         ],
                       ),
                     ],
@@ -418,9 +472,11 @@ class _MapScreenState extends ConsumerState<MapScreen>
             ),
           if (state.isLoading || state.error != null)
             Positioned(
-              top: 120,
-              left: 16,
-              right: 16,
+              top:
+                  MediaQuery.paddingOf(context).top +
+                  (isInformative ? 150 : 112),
+              left: 12,
+              right: 12,
               child: _buildMapStatusOverlay(context, state),
             ),
           Positioned(
@@ -430,290 +486,79 @@ class _MapScreenState extends ConsumerState<MapScreen>
             child: SafeArea(
               bottom: false,
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Container(
-                          decoration: BoxDecoration(
-                            color: scheme.surface.withValues(
-                              alpha: isDark ? 0.9 : 0.78,
-                            ),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          child: Text(
-                            'RTL Bus Tracker',
-                            style: Theme.of(context).textTheme.headlineSmall
-                                ?.copyWith(
-                                  fontWeight: FontWeight.w700,
-                                  color: scheme.onSurface,
-                                ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        const Spacer(),
-                        IconButton.filledTonal(
-                          onPressed: () =>
-                              c.loadInitial(force: true, shouldAutoFit: false),
-                          icon: const Icon(Icons.refresh),
-                          tooltip: 'Refresh',
-                          style: IconButton.styleFrom(
-                            backgroundColor: scheme.surfaceContainerHigh
-                                .withValues(alpha: isDark ? 0.94 : 0.86),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        IconButton.filledTonal(
-                          onPressed: () => context.push('/settings'),
-                          icon: const Icon(Icons.settings),
-                          tooltip: 'Settings',
-                          style: IconButton.styleFrom(
-                            backgroundColor: scheme.surfaceContainerHigh
-                                .withValues(alpha: isDark ? 0.94 : 0.86),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Container(
-                      decoration: BoxDecoration(
-                        color: scheme.surface.withValues(alpha: 0.96),
-                        borderRadius: BorderRadius.circular(24),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.1),
-                            blurRadius: 18,
-                            offset: const Offset(0, 8),
-                          ),
-                        ],
-                      ),
-                      padding: const EdgeInsets.fromLTRB(14, 14, 14, 12),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Area',
-                            style: Theme.of(context).textTheme.labelMedium
-                                ?.copyWith(color: scheme.onSurfaceVariant),
-                          ),
-                          const SizedBox(height: 6),
-                          InkWell(
-                            borderRadius: BorderRadius.circular(12),
-                            onTap: () => _showAreaSheet(
-                              context,
-                              state.areas,
-                              state.selectedAreaCode,
-                              c.selectArea,
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 8),
-                              child: Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      state.areas
-                                              .firstWhereOrNull(
-                                                (a) =>
-                                                    a.code ==
-                                                    state.selectedAreaCode,
-                                              )
-                                              ?.name ??
-                                          AppConfig.defaultAreaName,
-                                      style: Theme.of(
-                                        context,
-                                      ).textTheme.titleMedium,
-                                    ),
-                                  ),
-                                  const Icon(Icons.keyboard_arrow_down_rounded),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const Divider(height: 20),
-                          SizedBox(
-                            height: 44,
-                            child: ListView(
-                              key: const PageStorageKey<String>(
-                                'route_chip_list',
-                              ),
-                              controller: _routeChipsScrollController,
-                              scrollDirection: Axis.horizontal,
-                              children: state.routes.map((r) {
-                                final selected = state.selectedRouteCodes
-                                    .contains(r.routeCode);
-                                final color = _routeColor(r);
-                                return Padding(
-                                  padding: const EdgeInsets.only(right: 8),
-                                  child: FilterChip(
-                                    selected: selected,
-                                    showCheckmark: false,
-                                    avatar: selected
-                                        ? Icon(
-                                            Icons.check_circle,
-                                            size: 16,
-                                            color: _readableText(color),
-                                          )
-                                        : null,
-                                    label: Text(
-                                      r.routeNumber.isNotEmpty
-                                          ? r.routeNumber
-                                          : r.routeCode,
-                                    ),
-                                    labelStyle: TextStyle(
-                                      color: selected
-                                          ? _readableText(color)
-                                          : color,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                    side: BorderSide(color: color, width: 1.4),
-                                    backgroundColor: Colors.transparent,
-                                    selectedColor: color,
-                                    onSelected: (_) =>
-                                        c.toggleRoute(r.routeCode),
-                                  ),
-                                );
-                              }).toList(),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: Row(
-                              children: [
-                                LayerToggleChip(
-                                  label: 'Routes',
-                                  icon: Icons.alt_route,
-                                  selected: state.showRoutes,
-                                  onSelected: (v) => c.toggleLayer(routes: v),
-                                ),
-                                const SizedBox(width: 8),
-                                LayerToggleChip(
-                                  label: 'Stops',
-                                  icon: Icons.location_on,
-                                  selected: state.showStops,
-                                  onSelected: (v) => c.toggleLayer(stops: v),
-                                ),
-                                const SizedBox(width: 8),
-                                LayerToggleChip(
-                                  label: 'Live Buses',
-                                  icon: Icons.directions_bus,
-                                  selected: state.showBuses,
-                                  onSelected: (v) => c.toggleLayer(buses: v),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    if (state.offlineNotice)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: scheme.errorContainer,
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
-                            ),
-                            child: Text(
-                              'Offline mode: showing cached data',
-                              style: TextStyle(color: scheme.onErrorContainer),
-                            ),
-                          ),
-                        ),
-                      ),
+                    _buildTopBar(context, state, c, isInformative),
+                    const SizedBox(height: 8),
+                    _buildRouteStrip(context, state, c, isInformative),
+                    ..._buildStatusPills(context, state, isInformative),
                   ],
                 ),
               ),
             ),
           ),
-          Positioned(
-            right: 16,
-            bottom: 180,
-            child: Column(
-              children: [
-                FloatingActionButton.small(
-                  heroTag: 'map_zoom_in_fab',
-                  onPressed: () => _mapController.move(
-                    _mapController.camera.center,
-                    _mapController.camera.zoom + 1,
+          Positioned.fill(
+            child: CollapsibleMapDetails(
+              selectionKey: selectionKey,
+              icon: _selectedStop != null
+                  ? Icons.location_on_outlined
+                  : selectedBus != null
+                  ? Icons.directions_bus
+                  : Icons.route_outlined,
+              onOpened: () {
+                if (_selectedStop == null &&
+                    selectedBus == null &&
+                    primaryRoute != null) {
+                  unawaited(c.loadScheduleForRoute(primaryRoute));
+                }
+              },
+              detailsBuilder: (context) => _buildDetailsContent(
+                context: context,
+                state: state,
+                primaryRoute: primaryRoute,
+                selectedRoutes: selectedRoutes,
+                selectedBus: selectedBus,
+                stopsByCode: stopsByCode,
+              ),
+              overlaysBuilder: (context, controlsBottom) => [
+                Positioned(
+                  right: 12,
+                  bottom: controlsBottom,
+                  child: _buildMapControls(context, state, c),
+                ),
+                if (_isFollowingSelectedBus && selectedBus != null)
+                  Positioned(
+                    left: 12,
+                    bottom: controlsBottom,
+                    child: ActionChip(
+                      avatar: const Icon(Icons.gps_fixed, size: 18),
+                      label: Text(
+                        isInformative
+                            ? 'Following bus · tap to stop'
+                            : 'Following bus',
+                      ),
+                      onPressed: () =>
+                          setState(() => _isFollowingSelectedBus = false),
+                    ),
                   ),
-                  child: const Icon(Icons.add),
-                ),
-                const SizedBox(height: 8),
-                FloatingActionButton.small(
-                  heroTag: 'map_zoom_out_fab',
-                  onPressed: () => _mapController.move(
-                    _mapController.camera.center,
-                    _mapController.camera.zoom - 1,
+                if ((state.locationMessage ?? '').isNotEmpty)
+                  Positioned(
+                    left: 12,
+                    right: 72,
+                    bottom: controlsBottom + 52,
+                    child: _floatingSurface(
+                      context,
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Text(state.locationMessage!),
+                      ),
+                    ),
                   ),
-                  child: const Icon(Icons.remove),
-                ),
-                const SizedBox(height: 8),
-                FloatingActionButton.small(
-                  heroTag: 'map_fit_fab',
-                  onPressed: () => _fitPoints(state.fitPoints),
-                  child: const Icon(Icons.center_focus_strong),
-                ),
-                const SizedBox(height: 8),
-                FloatingActionButton.small(
-                  heroTag: 'map_location_fab',
-                  onPressed: () => c.toggleUserLocation(),
-                  child: Icon(
-                    state.showUserLocation
-                        ? Icons.my_location
-                        : Icons.location_searching,
-                  ),
-                ),
               ],
             ),
           ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            top: 0,
-            child: _buildDetailsSheet(
-              context: context,
-              state: state,
-              primaryRoute: primaryRoute,
-              selectedBus: selectedBus,
-              stopsByCode: stopsByCode,
-            ),
-          ),
-          if (_isFollowingSelectedBus && selectedBus != null)
-            Positioned(
-              left: 16,
-              bottom: 160,
-              child: ActionChip(
-                avatar: const Icon(Icons.gps_fixed, size: 18),
-                label: const Text('Following bus'),
-                onPressed: () =>
-                    setState(() => _isFollowingSelectedBus = false),
-              ),
-            ),
-          if ((state.locationMessage ?? '').isNotEmpty)
-            Positioned(
-              left: 12,
-              right: 12,
-              bottom: 140,
-              child: Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(10),
-                  child: Text(state.locationMessage!),
-                ),
-              ),
-            ),
           if (state.isLoading)
             const Positioned(
               top: 0,
@@ -726,62 +571,768 @@ class _MapScreenState extends ConsumerState<MapScreen>
     );
   }
 
-  Widget _buildDetailsSheet({
+  // ---------------------------------------------------------------------------
+  // Floating map chrome
+  // ---------------------------------------------------------------------------
+
+  Widget _floatingSurface(
+    BuildContext context, {
+    required Widget child,
+    double radius = 20,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Material(
+      color: scheme.surface.withValues(alpha: isDark ? 0.94 : 0.97),
+      elevation: 0,
+      borderRadius: BorderRadius.circular(radius),
+      clipBehavior: Clip.antiAlias,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(radius),
+          border: Border.all(
+            color: scheme.outlineVariant.withValues(alpha: 0.4),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: isDark ? 0.3 : 0.12),
+              blurRadius: 14,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: child,
+      ),
+    );
+  }
+
+  String _routeLabel(BusRoute r) =>
+      r.routeNumber.isNotEmpty ? r.routeNumber : r.routeCode;
+
+  String _routeDescriptiveName(BusRoute r) {
+    var name = r.name.trim();
+    if (name.isNotEmpty) {
+      if (name == name.toUpperCase() && name.length > 3) {
+        name = name
+            .split(' ')
+            .map(
+              (word) => word.isEmpty
+                  ? ''
+                  : '${word[0].toUpperCase()}${word.substring(1).toLowerCase()}',
+            )
+            .join(' ');
+      }
+      return name;
+    }
+    final from = (r.startStationName ?? '').trim();
+    final to = (r.endStationName ?? '').trim();
+    if (from.isNotEmpty && to.isNotEmpty && from != to) {
+      return '$from to $to';
+    }
+    return r.routeNumber.isNotEmpty ? r.routeNumber : r.routeCode;
+  }
+
+  Widget _buildTopBar(
+    BuildContext context,
+    MapState state,
+    MapController c,
+    bool isInformative,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    final areaName =
+        state.areas
+            .firstWhereOrNull((a) => a.code == state.selectedAreaCode)
+            ?.name ??
+        AppConfig.defaultAreaName;
+    final selectedCount = state.selectedRouteCodes.length;
+    return Row(
+      children: [
+        Expanded(
+          child: _floatingSurface(
+            context,
+            radius: 28,
+            child: SizedBox(
+              height: 52,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: InkWell(
+                      onTap: () => _showAreaSheet(
+                        context,
+                        state.areas,
+                        state.selectedAreaCode,
+                        c.selectArea,
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 16, right: 8),
+                        child: Row(
+                          children: [
+                            Icon(Icons.place_outlined, color: scheme.primary),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  if (isInformative)
+                                    Text(
+                                      'Area',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .labelSmall
+                                          ?.copyWith(
+                                            color: scheme.onSurfaceVariant,
+                                          ),
+                                    ),
+                                  Text(
+                                    areaName,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleSmall
+                                        ?.copyWith(fontWeight: FontWeight.w600),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Icon(Icons.expand_more_rounded, size: 20),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  Container(width: 1, height: 26, color: scheme.outlineVariant),
+                  InkWell(
+                    onTap: () => _showRoutePickerSheet(context),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.search_rounded, size: 20),
+                          const SizedBox(width: 6),
+                          Text(
+                            selectedCount == 0
+                                ? (isInformative ? 'Find route' : 'Routes')
+                                : '$selectedCount',
+                            style: Theme.of(context).textTheme.labelLarge,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        _floatingSurface(
+          context,
+          radius: 26,
+          child: IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.tune_rounded),
+            onPressed: () async {
+              c.setMapScreenActive(false);
+              await context.push('/settings');
+              if (mounted) c.setMapScreenActive(true);
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRouteStrip(
+    BuildContext context,
+    MapState state,
+    MapController c,
+    bool isInformative,
+  ) {
+    if (state.routes.isEmpty) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: isInformative ? 58 : 40,
+      child: ListView.separated(
+        key: const PageStorageKey<String>('route_chip_list'),
+        controller: _routeChipsScrollController,
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        itemCount: state.routes.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final r = state.routes[index];
+          final selected = state.selectedRouteCodes.contains(r.routeCode);
+          final color = _routeColor(r);
+          final onColor = _readableText(color);
+          final routeName = _routeDescriptiveName(r);
+          final bg = selected ? color : scheme.surface.withValues(alpha: 0.96);
+          final fg = selected ? onColor : scheme.onSurface;
+          return Material(
+            color: bg,
+            borderRadius: BorderRadius.circular(isInformative ? 16 : 20),
+            elevation: 2,
+            shadowColor: Colors.black26,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(isInformative ? 16 : 20),
+              onTap: () => c.toggleRoute(r.routeCode),
+              child: Container(
+                constraints: BoxConstraints(
+                  maxWidth: isInformative ? 280 : 120,
+                ),
+                padding: EdgeInsets.symmetric(
+                  horizontal: isInformative ? 10 : 14,
+                ),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(isInformative ? 16 : 20),
+                  border: Border.all(color: color, width: 1.6),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (isInformative)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? onColor.withValues(alpha: 0.18)
+                              : color,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          _routeLabel(r),
+                          style: TextStyle(
+                            color: selected ? onColor : _readableText(color),
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      )
+                    else ...[
+                      if (selected) ...[
+                        Icon(Icons.check_rounded, size: 16, color: fg),
+                        const SizedBox(width: 4),
+                      ] else ...[
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            color: color,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      Text(
+                        _routeLabel(r),
+                        style: TextStyle(
+                          color: fg,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                    if (isInformative) ...[
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              routeName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.labelMedium
+                                  ?.copyWith(
+                                    color: fg,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                            ),
+                            Text(
+                              '${r.stops.length} stops${r.fare != null ? ' · MVR ${r.fare!.toStringAsFixed(r.fare! % 1 == 0 ? 0 : 2)}' : ''}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: fg.withValues(alpha: 0.8),
+                                    fontSize: 10,
+                                  ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (selected) ...[
+                        const SizedBox(width: 6),
+                        Icon(Icons.check_circle, size: 16, color: fg),
+                      ],
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _statusPill(
+    BuildContext context, {
+    required IconData icon,
+    required String text,
+    Color? background,
+    Color? foreground,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Material(
+        color:
+            background ?? scheme.surfaceContainerHigh.withValues(alpha: 0.95),
+        borderRadius: BorderRadius.circular(999),
+        elevation: 1,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 15,
+                color: foreground ?? scheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  text,
+                  style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: foreground ?? scheme.onSurface,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildStatusPills(
+    BuildContext context,
+    MapState state,
+    bool isInformative,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    final pills = <Widget>[];
+    if (state.loadingResources.isNotEmpty) {
+      pills.add(
+        const Padding(
+          padding: EdgeInsets.only(top: 6),
+          child: ClipRRect(
+            borderRadius: BorderRadius.all(Radius.circular(4)),
+            child: LinearProgressIndicator(minHeight: 3),
+          ),
+        ),
+      );
+    }
+    if (state.offlineNotice) {
+      pills.add(
+        _statusPill(
+          context,
+          icon: Icons.cloud_off_rounded,
+          text: 'Offline mode: showing cached data',
+          background: scheme.errorContainer,
+          foreground: scheme.onErrorContainer,
+        ),
+      );
+    }
+    if (state.resourceStatuses.entries.any(
+      (e) =>
+          e.key.startsWith('live:') &&
+          state.selectedRouteCodes.contains(e.key.substring(5)) &&
+          (e.value.stale ||
+              e.value.fetchedAt == null ||
+              DateTime.now().difference(e.value.fetchedAt!) >
+                  const Duration(seconds: 30)),
+    )) {
+      pills.add(
+        _statusPill(
+          context,
+          icon: Icons.history_rounded,
+          text: _liveAgeLabel(state),
+        ),
+      );
+    }
+    if (state.resourceStatuses.entries.any(
+      (entry) =>
+          entry.value.error != null &&
+          (entry.key == 'routes' ||
+              state.selectedRouteCodes.any(
+                (code) =>
+                    entry.key == 'geometry:$code' || entry.key == 'eta:$code',
+              )),
+    )) {
+      pills.add(
+        _statusPill(
+          context,
+          icon: Icons.sync_problem_rounded,
+          text:
+              'Some route information could not be refreshed · Saved data remains available',
+        ),
+      );
+    }
+    if (isInformative &&
+        state.selectedRouteCodes.isEmpty &&
+        state.routes.isNotEmpty &&
+        !state.isLoading) {
+      pills.add(
+        _statusPill(
+          context,
+          icon: Icons.touch_app_outlined,
+          text:
+              'Tap a route to show it on the map, then tap a stop for arrival times',
+          background: scheme.primaryContainer.withValues(alpha: 0.95),
+          foreground: scheme.onPrimaryContainer,
+        ),
+      );
+    }
+    return pills;
+  }
+
+  Widget _buildMapControls(
+    BuildContext context,
+    MapState state,
+    MapController c,
+  ) {
+    Widget btn(IconData icon, String tip, VoidCallback onTap) => IconButton(
+      tooltip: tip,
+      icon: Icon(icon),
+      onPressed: onTap,
+      visualDensity: VisualDensity.compact,
+    );
+    Widget divider() => SizedBox(
+      width: 28,
+      child: Divider(
+        height: 1,
+        color: Theme.of(context).colorScheme.outlineVariant,
+      ),
+    );
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _floatingSurface(
+          context,
+          radius: 22,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              btn(
+                Icons.layers_outlined,
+                'Map layers',
+                () => _showLayersSheet(context),
+              ),
+              divider(),
+              btn(
+                Icons.refresh_rounded,
+                'Refresh',
+                () => c.loadInitial(force: true, shouldAutoFit: false),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        _floatingSurface(
+          context,
+          radius: 22,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              btn(
+                Icons.add,
+                'Zoom in',
+                () => _mapController.move(
+                  _mapController.camera.center,
+                  _mapController.camera.zoom + 1,
+                ),
+              ),
+              divider(),
+              btn(
+                Icons.remove,
+                'Zoom out',
+                () => _mapController.move(
+                  _mapController.camera.center,
+                  _mapController.camera.zoom - 1,
+                ),
+              ),
+              divider(),
+              btn(
+                Icons.center_focus_strong_outlined,
+                'Fit selected routes',
+                () => _fitPoints(state.fitPoints),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        _floatingSurface(
+          context,
+          radius: 22,
+          child: IconButton(
+            tooltip: 'My location',
+            isSelected: state.showUserLocation,
+            color: state.showUserLocation
+                ? Theme.of(context).colorScheme.primary
+                : null,
+            icon: Icon(
+              state.showUserLocation
+                  ? Icons.my_location
+                  : Icons.location_searching,
+            ),
+            onPressed: () => c.toggleUserLocation(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _showLayersSheet(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => Consumer(
+        builder: (context, ref, _) {
+          final s = ref.watch(mapControllerProvider);
+          final ctrl = ref.read(mapControllerProvider.notifier);
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Show on map',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      LayerToggleChip(
+                        label: 'Routes',
+                        icon: Icons.alt_route,
+                        selected: s.showRoutes,
+                        onSelected: (v) => ctrl.toggleLayer(routes: v),
+                      ),
+                      LayerToggleChip(
+                        label: 'Stops',
+                        icon: Icons.location_on,
+                        selected: s.showStops,
+                        onSelected: (v) => ctrl.toggleLayer(stops: v),
+                      ),
+                      LayerToggleChip(
+                        label: 'Live Buses',
+                        icon: Icons.directions_bus,
+                        selected: s.showBuses,
+                        onSelected: (v) => ctrl.toggleLayer(buses: v),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showRoutePickerSheet(BuildContext context) {
+    var query = '';
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (sheetContext) => FractionallySizedBox(
+        heightFactor: 0.85,
+        child: StatefulBuilder(
+          builder: (context, setSheetState) => Consumer(
+            builder: (context, ref, _) {
+              final s = ref.watch(mapControllerProvider);
+              final ctrl = ref.read(mapControllerProvider.notifier);
+              final informative =
+                  ref.watch(uiDetailLevelProvider) == UiDetailLevel.informative;
+              final q = query.trim().toLowerCase();
+              final routes = s.routes.where((r) {
+                if (q.isEmpty) return true;
+                return [
+                  r.routeNumber,
+                  r.routeCode,
+                  r.name,
+                  r.startStationName ?? '',
+                  r.endStationName ?? '',
+                  ...r.stops.map((st) => st.name),
+                ].any((v) => v.toLowerCase().contains(q));
+              }).toList();
+              return Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                    child: TextField(
+                      autofocus: false,
+                      onChanged: (v) => setSheetState(() => query = v),
+                      decoration: InputDecoration(
+                        prefixIcon: const Icon(Icons.search),
+                        hintText: informative
+                            ? 'Search by route, place or stop name'
+                            : 'Search routes',
+                        isDense: true,
+                        filled: true,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(28),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: routes.isEmpty
+                        ? const Center(child: Text('No matching routes'))
+                        : ListView.builder(
+                            itemCount: routes.length,
+                            itemBuilder: (context, i) {
+                              final r = routes[i];
+                              final color = _routeColor(r);
+                              final selected = s.selectedRouteCodes.contains(
+                                r.routeCode,
+                              );
+                              final routeName = _routeDescriptiveName(r);
+                              return ListTile(
+                                onTap: () => ctrl.toggleRoute(r.routeCode),
+                                leading: Container(
+                                  constraints: const BoxConstraints(
+                                    minWidth: 44,
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 6,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: color,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    _routeLabel(r),
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: _readableText(color),
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                                title: Text(
+                                  routeName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                subtitle: informative
+                                    ? Text(
+                                        [
+                                          'Route ${_routeLabel(r)}',
+                                          '${r.stops.length} stops',
+                                          if (r.fare != null)
+                                            'Fare MVR ${r.fare!.toStringAsFixed(r.fare! % 1 == 0 ? 0 : 2)}',
+                                        ].join(' · '),
+                                      )
+                                    : null,
+                                trailing: Checkbox(
+                                  value: selected,
+                                  onChanged: (_) =>
+                                      ctrl.toggleRoute(r.routeCode),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDetailsContent({
     required BuildContext context,
     required MapState state,
     required BusRoute? primaryRoute,
+    required List<BusRoute> selectedRoutes,
     required BusLocation? selectedBus,
     required Map<String, List<BusRoute>> stopsByCode,
   }) {
     final selectedStop = _selectedStop;
-    if (selectedStop == null && selectedBus == null && primaryRoute == null) {
-      return const SizedBox.shrink();
+    if (selectedStop != null) {
+      return _buildStopCard(
+        context,
+        selectedStop,
+        stopsByCode[selectedStop.code] ?? const [],
+        state.stopEtas[selectedStop.code] ?? const [],
+      );
     }
-    return DraggableScrollableSheet(
-      minChildSize: 0.16,
-      initialChildSize: 0.26,
-      maxChildSize: 0.94,
-      snap: true,
-      snapSizes: const [0.26, 0.5, 0.94],
-      builder: (context, scrollController) {
-        return Material(
-          elevation: 8,
-          color: Theme.of(context).colorScheme.surface,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-          child: SafeArea(
-            top: false,
-            child: ListView(
-              controller: scrollController,
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
-              children: [
-                Center(
-                  child: Container(
-                    width: 44,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.outlineVariant,
-                      borderRadius: BorderRadius.circular(8),
+    if (selectedBus != null) {
+      return _buildBusCard(context, selectedBus, state.routes);
+    }
+    if (primaryRoute != null) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (selectedRoutes.length > 1) ...[
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final route in selectedRoutes)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(
+                        key: ValueKey('details-route:${route.routeCode}'),
+                        selected: route.routeCode == primaryRoute.routeCode,
+                        label: Text(_routeLabel(route)),
+                        tooltip: _routeDescriptiveName(route),
+                        onSelected: (_) {
+                          if (route.routeCode == primaryRoute.routeCode) return;
+                          setState(() {
+                            _detailsRouteCode = route.routeCode;
+                            _routeStopSearch = '';
+                          });
+                          unawaited(
+                            ref
+                                .read(mapControllerProvider.notifier)
+                                .loadScheduleForRoute(route),
+                          );
+                        },
+                      ),
                     ),
-                  ),
-                ),
-                const SizedBox(height: 10),
-                if (selectedStop != null)
-                  _buildStopCard(
-                    context,
-                    selectedStop,
-                    stopsByCode[selectedStop.code] ?? const [],
-                    state.stopEtas[selectedStop.code] ?? const [],
-                  )
-                else if (selectedBus != null)
-                  _buildBusCard(context, selectedBus, state.routes)
-                else if (primaryRoute != null)
-                  _buildRouteCard(context, primaryRoute),
-              ],
+                ],
+              ),
             ),
+            const SizedBox(height: 12),
+          ],
+          KeyedSubtree(
+            key: ValueKey('route-details:${primaryRoute.routeCode}'),
+            child: _buildRouteCard(context, primaryRoute),
           ),
-        );
-      },
-    );
+        ],
+      );
+    }
+    return const SizedBox.shrink();
   }
 
   Widget _buildRouteCard(BuildContext context, BusRoute route) {
@@ -872,11 +1423,11 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    route.name,
+                    _routeDescriptiveName(route),
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                   Text(
-                    '${route.startStationName ?? '-'} -> ${route.endStationName ?? '-'}',
+                    '${route.stops.length} stops · ${route.areaName}${route.fare != null ? ' · MVR ${route.fare!.toStringAsFixed(route.fare! % 1 == 0 ? 0 : 2)}' : ''}',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ],
@@ -1121,6 +1672,21 @@ class _MapScreenState extends ConsumerState<MapScreen>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (routes.any((route) {
+          final status = viewState.resourceStatuses['eta:${route.routeCode}'];
+          return status != null &&
+              (status.stale ||
+                  (status.fetchedAt != null &&
+                      DateTime.now().difference(status.fetchedAt!) >=
+                          const Duration(seconds: 60)));
+        }))
+          const Padding(
+            padding: EdgeInsets.only(bottom: 8),
+            child: Text(
+              'Showing last known arrival estimates · Refreshing when connected',
+            ),
+          ),
+
         Row(
           children: [
             Expanded(
@@ -1144,6 +1710,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 ref
                     .read(mapControllerProvider.notifier)
                     .clearPreviewStopAlert();
+                ref.read(mapControllerProvider.notifier).setViewedEtaRoutes({});
                 setState(() => _selectedStop = null);
               },
               icon: const Icon(Icons.close),
@@ -1158,7 +1725,10 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 (r) => FilterChip(
                   selected: selectedRouteCode == r.routeCode,
                   label: Text(
-                    r.routeNumber.isEmpty ? r.routeCode : r.routeNumber,
+                    ref.watch(uiDetailLevelProvider) ==
+                            UiDetailLevel.informative
+                        ? '${_routeLabel(r)} · ${_routeDescriptiveName(r)}'
+                        : _routeLabel(r),
                   ),
                   onSelected: (_) {
                     ref
@@ -1540,17 +2110,24 @@ class _MapScreenState extends ConsumerState<MapScreen>
     );
   }
 
-  void _onDarkTileError(Object tile, Object error, StackTrace? stackTrace) {
-    if (!kDebugMode) return;
-    final message = error.toString();
-    final hasAuthError = message.contains('401') || message.contains('403');
-    DebugLog.throttled(
-      hasAuthError ? 'map_dark_tile_auth_error' : 'map_dark_tile_error',
-      hasAuthError
-          ? 'Dark tile auth error detected ($message). Falling back to light tiles.'
-          : 'Dark tile fetch error: $message',
-      interval: const Duration(seconds: 8),
-    );
+  String _liveAgeLabel(MapState state) {
+    final times = state.resourceStatuses.entries
+        .where(
+          (e) =>
+              e.key.startsWith('live:') &&
+              state.selectedRouteCodes.contains(e.key.substring(5)),
+        )
+        .map((e) => e.value.fetchedAt)
+        .whereType<DateTime>()
+        .where((t) => t.millisecondsSinceEpoch > 0)
+        .toList();
+    if (times.isEmpty) return 'Live positions unavailable · Retrying';
+    final oldest = times.reduce((a, b) => a.isBefore(b) ? a : b);
+    final seconds = DateTime.now().difference(oldest).inSeconds;
+    final age = seconds < 60
+        ? '$seconds seconds ago'
+        : '${seconds ~/ 60} minutes ago';
+    return 'Showing last known positions · Updated $age';
   }
 
   String _formatTime(String raw) {
@@ -1585,6 +2162,12 @@ class _MapScreenState extends ConsumerState<MapScreen>
               '${route?.routeNumber ?? bus.routeCode} • ${bus.busCode.isNotEmpty ? bus.busCode : bus.plateNumber}',
               style: Theme.of(context).textTheme.titleMedium,
             ),
+            if (route != null &&
+                ref.watch(uiDetailLevelProvider) == UiDetailLevel.informative)
+              Text(
+                'Route ${_routeLabel(route)}: ${_routeDescriptiveName(route)}',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
             if ((bus.destination ?? '').isNotEmpty)
               Text('Destination: ${bus.destination}'),
             if ((bus.tripDirection ?? bus.direction ?? '').isNotEmpty)
